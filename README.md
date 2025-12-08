@@ -13,6 +13,10 @@ This package provides a simple way to integrate the controller without custom fi
 
 ---
 
+
+## 📷 Sensors and controls
+![](images/webserver_esphome.png)
+
 ## 📦 Installation
 
 1. Ensure you have a working ESPHome environment.
@@ -51,7 +55,8 @@ Once flashed:
 
 ## 📚 Notes
 - The integration is designed to be **plug-and-play**: no manual component coding required.
-- For advanced customization, you can edit `package.yaml` directly in your ESPHome configuration.
+- For advanced customization, you can edit `package.yaml` directly in your ESPHome configuration with extension and overriding.
+- The status of the project is in early stages; use at your own risk and report any issues you encounter.
 
 ---
 
