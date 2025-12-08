@@ -8,6 +8,14 @@ substitutions:
   TX_BUFFER: "0000fff1-0000-1000-8000-00805f9b34fb"
   RX_BUFFER: "0000fff2-0000-1000-8000-00805f9b34fb"
 
+# Enable logging
+logger:
+  # level: VERY_VERBOSE
+  # logs:
+  #   esp32_ble_client: DEBUG
+  #   esp32_ble: VERY_VERBOSE
+  #   esp32_ble_tracker: INFO
+
 esp32_ble:
   io_capability: keyboard_display
 
