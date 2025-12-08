@@ -1,0 +1,431 @@
+substitutions:
+  pincode: 000000
+  mac_address: "" # no default
+
+esp32_ble:
+  io_capability: keyboard_display
+
+ble_client:
+  - mac_address: ${mac_address}
+    id: my_ble_device
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            ESP_LOGD("ble_client_lambda", "Connected to BLE device");
+            id(my_ble_device)->pair();
+    on_passkey_request:
+      then:
+        - lambda: |-
+            ESP_LOGD("ble_client_lambda", "PAIRING BLE passkey request");
+        - ble_client.passkey_reply:
+            id: my_ble_device
+            passkey: ${pincode}
+    on_disconnect:
+      then:
+        - lambda: |-
+            ESP_LOGD("ble_client_lambda", "Disconnected from BLE device");
+
+# Between writes and reads, we need to store which batch we actually waiting
+
+globals:
+  - id: current_batch
+    type: int
+    initial_value: "0"
+
+  - id: current_tx_buffer
+    type: std::vector<uint8_t>
+
+  - id: is_polling_data
+    type: bool
+    initial_value: "false"
+
+  - id: is_writting_data
+    type: bool
+    initial_value: "false"
+
+  - id: pool_batches
+    type: std::vector<std::vector<std::pair<std::string, std::array<uint8_t, 2>>>> # IMPORTANT: It must be 5 elements!
+    initial_value: |-
+      {
+        {
+          {"cAmbientTemp", {0xF2, 0x1E}},
+          {"vTcTemp1", {0x96, 0x1D}},
+          {"cPowerIcon", {0xBE, 0x1C}},
+          {"cControllerStatus", {0x82, 0x1E}},
+          {"cAirSlider", {0x62, 0x1E}}
+        },
+        {
+          {"cMotorError", {0x2A, 0x1E}},
+          {"cSensorError", {0x4E, 0x1D}},
+          {"cRefillStatus", {0x8C, 0x1E}},
+          {"cAirSliderAutoManual", {0xEC, 0x1D}},
+          {"_bDoorOpen", {0x7C, 0x1E}}
+        }
+      }
+
+# Main trigger
+interval:
+  - interval: 1s
+    then:
+      - script.execute: pool_batch_all
+
+button:
+  - platform: template
+    name: "Reboot BLE"
+    device_class: restart # makes it behave like the restart button
+    on_press:
+      - lambda: id(my_ble_device).set_auto_connect(false); // disable auto connect
+      - ble_client.disconnect: my_ble_device
+      - delay: 10s
+      - button.press: restart_button
+
+  - platform: restart
+    internal: True
+    id: restart_button
+    name: "Restart ESP"
+
+script:
+  - id: write_user_input
+    mode: queued
+    parameters:
+      address: std::vector<uint8_t>
+      data: std::vector<uint8_t>
+    then:
+      - globals.set:
+          id: is_writting_data
+          value: "true"
+
+      - wait_until:
+          condition:
+            lambda: "return ! id(is_polling_data);"
+
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: ${MAIN_SERVICE}
+          characteristic_uuid: ${TX_BUFFER}
+          value: !lambda |-
+            std::vector<uint8_t> tx_buffer = address;
+
+            std::string hex;
+            for (auto b : tx_buffer) {
+              char buf[10];
+              sprintf(buf, "%02X ", b);
+              hex += buf;
+            }
+            ESP_LOGD("ble", "TX address (%d bytes): %s", tx_buffer.size(), hex.c_str());
+
+            return tx_buffer;
+      - delay: 2s
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: ${MAIN_SERVICE}
+          characteristic_uuid: ${RX_BUFFER}
+          value: !lambda |-
+            std::vector<uint8_t> tx_buffer = data;
+
+            std::string hex;
+            for (auto b : tx_buffer) {
+              char buf[10];
+              sprintf(buf, "%02X ", b);
+              hex += buf;
+            }
+            ESP_LOGD("ble", "TX data (%d bytes): %s", tx_buffer.size(), hex.c_str());
+
+            return tx_buffer;
+      - globals.set:
+          id: is_writting_data
+          value: "false"
+
+  - id: batch_to_buffer
+    parameters:
+      current_batch: int
+    then:
+      - lambda: |-
+          // Obtain the current batch
+          // auto &vec = pool_batches->value()[current_batch];
+          auto &vec = id(pool_batches)[current_batch];
+
+          // Declare a dynamic vector of bytes
+          std::vector<uint8_t> flat_bytes;
+          flat_bytes.reserve(vec.size() * 2);  // reserve space for efficiency
+            
+          // Fill the vector
+          for (auto &entry : vec) {
+              flat_bytes.push_back(entry.second[0]);
+              flat_bytes.push_back(entry.second[1]);
+          }
+
+          id(current_tx_buffer) = flat_bytes;
+
+  - id: pool_batch_all
+    then:
+      - repeat:
+          count: 2 # Number of batches
+          then:
+            - delay: 200ms # Small window for user input
+            - wait_until:
+                condition:
+                  lambda: "return ! id(is_writting_data);"
+
+            - globals.set:
+                id: is_polling_data
+                value: "true"
+            - lambda: ESP_LOGI("main", "Fetching batch %d", iteration);
+            - lambda: |-
+                // Define which batch we're working with
+                id(current_batch) = iteration;
+
+                // Transform the current batch to TX info
+                id(batch_to_buffer)->execute(iteration);
+
+            - ble_client.ble_write:
+                id: my_ble_device
+                service_uuid: ${MAIN_SERVICE}
+                characteristic_uuid: ${TX_BUFFER}
+                value: !lambda |-
+                  std::vector<uint8_t> tx_buffer = id(current_tx_buffer);
+
+                  std::string hex;
+                  for (auto b : tx_buffer) {
+                    char buf[10];
+                    sprintf(buf, "%02X ", b);
+                    hex += buf;
+                  }
+                  ESP_LOGD("ble", "TX address (%d bytes): %s", tx_buffer.size(), hex.c_str());
+
+                  return tx_buffer;
+
+            - wait_until:
+                condition:
+                  lambda: "return id(is_writting_data);"
+                timeout: 2s # Device take time to process. Wait meanwhile
+            - if:
+                condition:
+                  lambda: "return id(is_writting_data);"
+                then:
+                  - logger.log: "User requested write data. Cancelling poll"
+                  - globals.set:
+                      id: is_polling_data
+                      value: "false"
+                else:
+                  - component.update: read_data_buffer # No user write request.
+
+            - wait_until:
+                condition:
+                  lambda: "return ! id(is_polling_data);"
+
+text_sensor:
+  - platform: template
+    id: cControllerStatusText
+    name: "Status Text"
+
+  - platform: template
+    id: cMotorErrorText
+    name: "cMotorError Text"
+
+select:
+  - platform: template
+    id: cPowerIcon
+    name: "Power state"
+    options:
+      - "Low"
+      - "Mid"
+      - "High"
+    initial_option: "Low"
+    optimistic: true
+    set_action:
+      - lambda: |-
+          ESP_LOGD("ble", "Triggered action");
+          auto index = id(cPowerIcon).index_of(x);
+          if (index.has_value()) {
+            int raw_value = index.value();
+
+            // Increase by 1, since server accepts only 1, 2 and 3 as input
+            raw_value = raw_value + 1;
+
+            id(write_user_input)->execute({0xBE, 0x1C},{(uint8_t)raw_value, 0x00});
+          } else {
+            ESP_LOGE("main", "Undefined state. WTF?");
+          }
+
+switch:
+  - platform: template
+    id: cAirSliderAutoManual
+    optimistic: true
+    name: "Air Slider Manual mode"
+    on_state:
+      - lambda: |-
+          ESP_LOGD("ble", "Triggered action");
+          uint8_t value = x ? 0x01 : 0x00;
+          id(write_user_input)->execute({0xEC, 0x1D},{value, 0x00});
+
+# TODO: Implement a read operation
+number:
+  - platform: template
+    id: cAirSliderPercentage
+    name: "Air Slider value"
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    set_action:
+      then:
+        - lambda: |-
+            ESP_LOGD("ble", "Triggered action");
+            if (id(cAirSliderAutoManual).state) {
+              id(write_user_input)->execute({0x62, 0x1E},{(uint8_t)x, 0x00});
+            } else {
+              ESP_LOGW("main", "Manual mode not enabled");
+              id(cAirSliderPercentage).publish_state(0);
+            }
+binary_sensor:
+  - platform: template
+    id: _bDoorOpen
+    device_class: door
+    name: "_bDoorOpen"
+
+sensor:
+  - platform: template
+    id: cAmbientTemp
+    name: "Ambient temperature"
+    icon: "mdi:thermometer"
+    device_class: "temperature"
+    state_class: "measurement"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+
+  - platform: template
+    id: vTcTemp1
+    name: "Stove temperature"
+    icon: "mdi:fire"
+    device_class: "temperature"
+    state_class: "measurement"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+
+  - platform: template
+    id: cAirSlider
+    name: "Air slider"
+    icon: "mdi:fan"
+    state_class: "measurement"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+
+  - platform: template
+    id: cControllerStatus
+    name: "Status"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+    on_value:
+      then:
+        - lambda: |-
+            std::string value = "Unknown";
+
+            if (x == 0) {
+              value = "Standby";
+            } else if (x == 1) {
+              value = "Ignition";
+            } else if (x == 2) {
+              value = "Rising";
+            } else if (x == 3) {
+              value = "Falling";
+            } else if (x == 4) {
+              value = "Refill";
+            } else if (x == 5) {
+              value = "Glowing";
+            }
+
+            id(cControllerStatusText).publish_state(value);
+
+  - platform: template
+    id: cMotorError
+    name: "cMotorError"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+    on_value:
+      then:
+        - lambda: |-
+            std::string value = "Unknown";
+
+            if (x == 0) {
+              value = "OK";
+            } else if (x == 20) {
+              value = "Motor circuit open";
+            } else if (x == 128) {
+              value = "Air slider OK";
+            }
+
+            id(cMotorErrorText).publish_state(value);
+
+  - platform: template
+    id: cSensorError
+    name: "cSensorError"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+
+  - platform: template
+    id: cRefillStatus
+    name: "cRefillStatus"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: my_ble_device
+    id: read_data_buffer
+    internal: true
+    name: "RX stream"
+    service_uuid: ${MAIN_SERVICE}
+    characteristic_uuid: ${RX_BUFFER}
+    update_interval: never
+    lambda: |-
+      std::string hex;
+      for (auto b : x) {
+        char buf[10];
+        sprintf(buf, "%02X ", b);
+        hex += buf;
+      }
+      ESP_LOGD("ble", "RX data (%d bytes): %s", x.size(), hex.c_str());
+
+
+      switch (id(current_batch)) {
+        case 0:
+          id(cAmbientTemp).publish_state((x[1] << 8) | x[0]);
+          id(vTcTemp1).publish_state((x[3] << 8) | x[2]);
+          id(cPowerIcon).publish_state(((x[5] << 8) | x[4]) - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
+          id(cControllerStatus).publish_state((x[7] << 8) | x[6]);
+          id(cAirSlider).publish_state((x[9] << 8) | x[8]);
+          break;
+        case 1:
+          id(cMotorError).publish_state((x[1] << 8) | x[0]);
+          id(cSensorError).publish_state((x[3] << 8) | x[2]);
+          id(cRefillStatus).publish_state((x[5] << 8) | x[4]);
+          id(cAirSliderAutoManual).publish_state(((x[7] << 8) | x[6]) == 1); // 0 off, 1 on
+          id(_bDoorOpen).publish_state(((x[9] << 8) | x[8]) == 1); // 0 closed, 1 open
+          break;
+        default:
+          ESP_LOGD("mode", "Unknown current_batch %d", id(current_batch));
+          break;
+      }
+
+      id(is_polling_data) = false;
+
+      return NAN;
