@@ -1,6 +1,12 @@
 substitutions:
+  # Expected user input
+  mac_address: "" # fail by default
   pincode: 000000
-  mac_address: "" # no default
+
+  # Internal
+  MAIN_SERVICE: "0000fff0-0000-1000-8000-00805f9b34fb"
+  TX_BUFFER: "0000fff1-0000-1000-8000-00805f9b34fb"
+  RX_BUFFER: "0000fff2-0000-1000-8000-00805f9b34fb"
 
 esp32_ble:
   io_capability: keyboard_display
