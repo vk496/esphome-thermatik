@@ -11,10 +11,11 @@ substitutions:
 # Enable logging
 logger:
   # level: VERY_VERBOSE
-  # logs:
-  #   esp32_ble_client: DEBUG
-  #   esp32_ble: VERY_VERBOSE
-  #   esp32_ble_tracker: INFO
+  logs:
+    script: ERROR
+    # esp32_ble_client: DEBUG
+    # esp32_ble: VERY_VERBOSE
+    # esp32_ble_tracker: INFO
 
 esp32_ble:
   io_capability: keyboard_display
@@ -43,6 +44,11 @@ ble_client:
 # Between writes and reads, we need to store which batch we actually waiting
 
 globals:
+  - id: last_ble_read
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
   - id: current_batch
     type: int
     initial_value: "0"
@@ -87,6 +93,23 @@ globals:
 
 # Main trigger
 interval:
+  - interval: 3min
+    startup_delay: 2min
+    then:
+      - lambda: |-
+          uint32_t now = millis() / 1000;
+          uint32_t last = id(last_ble_read);
+
+          // Handle millis() rollover automatically using subtraction
+          uint32_t diff = now - last;
+
+          if (last == 0 || diff > 300) {  // 300s = 5 minutes
+            ESP_LOGE("ble_watchdog", "BLE freeze detected, rebooting...");
+            id(restart_button).press();
+          } else {
+            ESP_LOGI("ble_watchdog", "BLE watchdog OK (diff=%u s)", diff);
+          }
+
   - interval: 1s
     then:
       - script.execute: pool_batch_all
@@ -445,5 +468,8 @@ sensor:
       }
 
       id(is_polling_data) = false;
+
+      id(last_ble_read) = millis() / 1000;  // seconds
+      ESP_LOGD("ble_watchdog", "Updated last BLE read: %u", id(last_ble_read));
 
       return NAN;
