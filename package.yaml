@@ -389,6 +389,12 @@ sensor:
               value = "Refill";
             } else if (x == 5) {
               value = "Glowing";
+            } else if (x == 6) {
+              value = "No ignition";
+            } else if (x == 7) {
+              value = "Overheated";
+            } else if (x == 8) {
+              value = "Reducing glow";
             }
 
             id(cControllerStatusText).publish_state(value);
