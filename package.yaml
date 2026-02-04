@@ -389,6 +389,12 @@ sensor:
               value = "Refill";
             } else if (x == 5) {
               value = "Glowing";
+            } else if (x == 6) {
+              value = "No ignition";
+            } else if (x == 7) {
+              value = "Overheated";
+            } else if (x == 8) {
+              value = "Reducing glow";
             }
 
             id(cControllerStatusText).publish_state(value);
@@ -448,7 +454,15 @@ sensor:
         case 0:
           id(cAmbientTemp).publish_state((x[1] << 8) | x[0]);
           id(vTcTemp1).publish_state((x[3] << 8) | x[2]);
-          id(cPowerIcon).publish_state(((x[5] << 8) | x[4]) - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
+         // POWER ICON VALIDIERUNG
+          {
+          int raw_power = (x[5] << 8) | x[4];
+          if (raw_power >= 1 && raw_power <= 3) {
+          id(cPowerIcon).publish_state(raw_power - 1);
+           } else {
+                 ESP_LOGW("ble_parse", "Ignore invalid Power value: %d", raw_power);
+                  }
+           } // Values are 1, 2 and 3. Start with 0 so we can work with index
           id(cControllerStatus).publish_state((x[7] << 8) | x[6]);
           id(cAirSlider).publish_state((x[9] << 8) | x[8]);
           break;
