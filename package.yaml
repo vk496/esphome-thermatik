@@ -10,13 +10,10 @@ substitutions:
 
 # Enable logging
 logger:
-#  level: VERY_VERBOSE
-#  level: INFO
+ # level: VERY_VERBOSE
   logs:
-    script: DEBUG
-#    esp32_ble_client: DEBUG
-#    esp32_ble: VERY_VERBOSE
-#    esp32_ble_tracker: INFO
+    script: ERROR
+    esp32_ble_tracker: INFO
 
 esp32_ble:
   io_capability: keyboard_display
