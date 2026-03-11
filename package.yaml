@@ -13,9 +13,7 @@ logger:
   # level: VERY_VERBOSE
   logs:
     script: ERROR
-    # esp32_ble_client: DEBUG
-    # esp32_ble: VERY_VERBOSE
-    # esp32_ble_tracker: INFO
+    esp32_ble_tracker: INFO
 
 esp32_ble:
   io_capability: keyboard_display
@@ -29,6 +27,7 @@ ble_client:
         - lambda: |-
             ESP_LOGD("ble_client_lambda", "Connected to BLE device");
             id(my_ble_device)->pair();
+            id(connected)=true;
     on_passkey_request:
       then:
         - lambda: |-
@@ -40,6 +39,7 @@ ble_client:
       then:
         - lambda: |-
             ESP_LOGD("ble_client_lambda", "Disconnected from BLE device");
+            id(connected)=false;
 
 # Between writes and reads, we need to store which batch we actually waiting
 
@@ -49,18 +49,33 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  - id: connected
+    type: bool
+    initial_value: "false"
+
+  - id: is_updating
+    type: bool
+    initial_value: "false"
+
+  - id: powerIcon_update
+    type: bool
+    initial_value: "false"
+
   - id: current_batch
     type: int
-    initial_value: "0"
+    initial_value: "3"
 
   - id: current_tx_buffer
     type: std::vector<uint8_t>
 
-  - id: is_polling_data
+  - id: last_data
+    type: std::vector<uint8_t>
+
+  - id: is_polling
     type: bool
     initial_value: "false"
 
-  - id: is_writting_data
+  - id: is_writing
     type: bool
     initial_value: "false"
 
@@ -77,24 +92,24 @@ globals:
         },
         {
           {"cMotorError", {0x2A, 0x1E}},
-          {"cSensorError", {0x4E, 0x1D}},
-          {"cRefillStatus", {0x8C, 0x1E}},
+          {"BoardTemp", {0x98, 0x1D}},
+          {"cAirSliderPercentage", {0x62, 0x1E}},
           {"cAirSliderAutoManual", {0xEC, 0x1D}},
           {"_bDoorOpen", {0x7C, 0x1E}}
         },
         {
-          {"cAirSliderPercentage", {0x62, 0x1E}},
-          {"cAirSliderInitialized", {0x64, 0x1E}},
-          {"unknown2", {0xCE, 0x1C}},
-          {"unknown3", {0xD4, 0x1C}},
-          {"BoardTemp", {0x98, 0x1D}}
+          {"cRefillStatus", {0x8C, 0x1E}},
+          {"cSensorError", {0x4E, 0x1D}},
+          {"BoardTemp", {0x98, 0x1D}},
+          {"cPowerIcon", {0xBE, 0x1C}},
+          {"_bDoorOpen", {0x7C, 0x1E}}
         }
       }
 
 # Main trigger
 interval:
   - interval: 3min
-    startup_delay: 2min
+    startup_delay: 5min
     then:
       - lambda: |-
           uint32_t now = millis() / 1000;
@@ -107,17 +122,39 @@ interval:
             ESP_LOGE("ble_watchdog", "BLE freeze detected, rebooting...");
             id(restart_button).press();
           } else {
-            ESP_LOGI("ble_watchdog", "BLE watchdog OK (diff=%u s)", diff);
+            ESP_LOGD("ble_watchdog", "BLE watchdog OK (diff=%u s)", diff);
           }
 
-  - interval: 1s
+  - interval: 30s
+    startup_delay: 30s
     then:
       - script.execute: pool_batch_all
+
+cover:
+  - platform: template
+    id: sezam
+    name: "Sezam"
+    disabled_by_default: true
+    device_class: garage
+    optimistic: false
+    open_action:
+      - lambda: |-
+          ESP_LOGD("ble", "Triggered Open Door");
+          id(write_user_input)->execute({0xCA, 0x1E},{0x01, 0x00});
+          id(sezam).current_operation=COVER_OPERATION_OPENING;
+          id(sezam).publish_state();
+    close_action:
+      - lambda: |-
+          ESP_LOGD("ble", "Triggered Close Door");
+          id(write_user_input)->execute({0xCA, 0x1E},{0x01, 0x00});
+          id(sezam).current_operation=COVER_OPERATION_CLOSING;
+          id(sezam).publish_state();
 
 button:
   - platform: template
     name: "Reboot BLE"
     device_class: restart # makes it behave like the restart button
+    disabled_by_default: true
     on_press:
       - lambda: id(my_ble_device).set_auto_connect(false); // disable auto connect
       - ble_client.disconnect: my_ble_device
@@ -128,22 +165,47 @@ button:
     internal: True
     id: restart_button
     name: "Restart ESP"
+  - platform: template
+    name: "Door Remote"
+    icon: "mdi:fireplace-off"
+    disabled_by_default: true
+    on_press:
+      - lambda: |-
+          ESP_LOGD("ble", "Triggered Door");
+          id(write_user_input)->execute({0xCA, 0x1E},{0x01, 0x00});
 
 script:
   - id: write_user_input
     mode: queued
+    max_runs: 2
     parameters:
       address: std::vector<uint8_t>
       data: std::vector<uint8_t>
     then:
       - globals.set:
-          id: is_writting_data
+          id: is_writing
           value: "true"
+#      - wait_until:
+#          condition:
+#            #lambda: "return id(connected) && ! id(is_polling);"
+#            lambda: "return id(connected);"
+#          timeout: 15s
+      - lambda: |-
+          std::vector<uint8_t> tx_buffer = address;
+          std::string hex;
+          for (auto b : tx_buffer) {
+            char buf[10];
+            sprintf(buf, "%02X ", b);
+            hex += buf;
+          }
 
-      - wait_until:
-          condition:
-            lambda: "return ! id(is_polling_data);"
-
+          if (! id(connected)) {
+            ESP_LOGE("ble","NOT Connected, ignoring write to address (%d bytes): %s", tx_buffer.size(), hex.c_str());
+            id(write_user_input).stop();
+            return;
+          }
+          // stop the polling
+          id(pool_batch_all).stop();
       - ble_client.ble_write:
           id: my_ble_device
           service_uuid: ${MAIN_SERVICE}
@@ -160,7 +222,7 @@ script:
             ESP_LOGD("ble", "TX address (%d bytes): %s", tx_buffer.size(), hex.c_str());
 
             return tx_buffer;
-      - delay: 2s
+      - delay: 200ms
       - ble_client.ble_write:
           id: my_ble_device
           service_uuid: ${MAIN_SERVICE}
@@ -177,8 +239,19 @@ script:
             ESP_LOGD("ble", "TX data (%d bytes): %s", tx_buffer.size(), hex.c_str());
 
             return tx_buffer;
+      - globals.set: # we cancel the poll results, as the write command will interfere
+          id: is_polling
+          value: "false"
+      - delay: 1s
+      - component.update: read_data_buffer # No user write request.
+      - wait_until:
+          condition:
+            lambda: "return ! id(is_writing);"
+          timeout: 15s
+      - lambda: |-
+          ESP_LOGD("ble", "Writing command is done");
       - globals.set:
-          id: is_writting_data
+          id: is_writing
           value: "false"
 
   - id: batch_to_buffer
@@ -204,25 +277,29 @@ script:
 
   - id: pool_batch_all
     then:
+      - globals.set:
+          id: current_batch
+          value: "42"
       - repeat:
           count: 3 # Number of batches
           then:
-            - delay: 200ms # Small window for user input
             - wait_until:
                 condition:
-                  lambda: "return ! id(is_writting_data);"
-
-            - globals.set:
-                id: is_polling_data
-                value: "true"
-            - lambda: ESP_LOGI("main", "Fetching batch %d", iteration);
+                  lambda: "return id(connected) && ! id(is_writing);"
+                timeout: 5s
             - lambda: |-
-                // Define which batch we're working with
-                id(current_batch) = iteration;
-
+                if (!id(connected) || id(is_writing)) {
+                  ESP_LOGE("ble", "Timed out for batch[%d] %d %d",iteration, id(connected), id(is_writing));
+                  id(pool_batch_all).stop();
+                  return;
+                }
+            - globals.set:
+                id: is_polling
+                value: "true"
+            - lambda: |-
+                ESP_LOGD("main", "Fetching batch %d", iteration);
                 // Transform the current batch to TX info
                 id(batch_to_buffer)->execute(iteration);
-
             - ble_client.ble_write:
                 id: my_ble_device
                 service_uuid: ${MAIN_SERVICE}
@@ -236,51 +313,57 @@ script:
                     sprintf(buf, "%02X ", b);
                     hex += buf;
                   }
-                  ESP_LOGD("ble", "TX address (%d bytes): %s", tx_buffer.size(), hex.c_str());
+                  ESP_LOGD("ble", "TX address[%d] (%d bytes): %s", iteration, tx_buffer.size(), hex.c_str());
 
                   return tx_buffer;
-
+            - delay: 1s
+            - lambda: |-
+                id(current_batch) = iteration;
+            - component.update: read_data_buffer
             - wait_until:
                 condition:
-                  lambda: "return id(is_writting_data);"
-                timeout: 2s # Device take time to process. Wait meanwhile
-            - if:
-                condition:
-                  lambda: "return id(is_writting_data);"
-                then:
-                  - logger.log: "User requested write data. Cancelling poll"
-                  - globals.set:
-                      id: is_polling_data
-                      value: "false"
-                else:
-                  - component.update: read_data_buffer # No user write request.
-
-            - wait_until:
-                condition:
-                  lambda: "return ! id(is_polling_data);"
+                  lambda: "return ! id(is_polling);"
+                timeout: 15s
+            - lambda: |-
+               if (id(is_polling)) {
+                 ESP_LOGE("ble", "poll not done in 15s %d", id(current_batch));
+                 id(is_polling) = false;
+               }
+            - lambda: |-
+                ESP_LOGD("ble", "Finished poll for %d", id(current_batch));
+            - delay: 3s
+      - lambda: |-
+          ESP_LOGD("ble", "Finished polls", id(current_batch));
+          id(current_batch) = 42;
 
 text_sensor:
   - platform: template
     id: cControllerStatusText
-    name: "Status Text"
+    icon: "mdi:fireplace"
+    name: "Status"
 
   - platform: template
     id: cMotorErrorText
-    name: "cMotorError Text"
+    icon: "mdi:engine"
+    name: "Motor Status"
 
 select:
   - platform: template
     id: cPowerIcon
-    name: "Power state"
+    name: "Heating"
+    icon: "mdi:fire"
     options:
       - "Low"
       - "Mid"
       - "High"
-    initial_option: "Low"
     optimistic: true
     set_action:
       - lambda: |-
-          ESP_LOGD("ble", "Triggered action");
+          if (id(is_updating)) {
+            ESP_LOGE("ble", "Ignored powerIcon command while updating");
+            return;
+          }
+          ESP_LOGD("ble", "Triggered set powerIcon action");
           auto index = id(cPowerIcon).index_of(x);
           if (index.has_value()) {
             int raw_value = index.value();
@@ -288,7 +371,8 @@ select:
             // Increase by 1, since server accepts only 1, 2 and 3 as input
             raw_value = raw_value + 1;
 
-            id(write_user_input)->execute({0xBE, 0x1C},{(uint8_t)raw_value, 0x00});
+            id(write_user_input)->execute({0x5C, 0x1C},{(uint8_t)raw_value, 0x00});
+            id(powerIcon_update) = true;
           } else {
             ESP_LOGE("main", "Undefined state. WTF?");
           }
@@ -298,11 +382,26 @@ switch:
     id: cAirSliderAutoManual
     optimistic: true
     name: "Air Slider Manual mode"
-    on_state:
+    on_turn_on:
       - lambda: |-
-          ESP_LOGD("ble", "Triggered action");
-          uint8_t value = x ? 0x01 : 0x00;
-          id(write_user_input)->execute({0xEC, 0x1D},{value, 0x00});
+          if (id(is_updating)) {
+            ESP_LOGE("ble", "Ignored airsliderManualSwitch ON command while updating");
+            return;
+          }
+          if (id(connected)) {
+            ESP_LOGD("ble", "Turned manual slider ON");
+            id(write_user_input)->execute({0xEC, 0x1D},{{0x01}, 0x00});
+          }
+    on_turn_off:
+      - lambda: |-
+          if (id(is_updating)) {
+            ESP_LOGE("ble", "Ignored airsliderManualSwitch OFF command while updating");
+            return;
+          }
+          if (id(connected)) { // when the entity is initialized, this function is triggered
+            ESP_LOGD("ble", "Turned manual slider OFF");
+            id(write_user_input)->execute({0xEC, 0x1D},{{0x00}, 0x00});
+          }
 
 # TODO: Implement a read operation
 number:
@@ -313,22 +412,32 @@ number:
     max_value: 100
     step: 1
     unit_of_measurement: "%"
+    icon: "mdi:fan-alert"
     set_action:
       then:
         - lambda: |-
-            ESP_LOGD("ble", "Triggered action");
+            if (id(is_updating)) {
+              ESP_LOGE("ble", "Ignored AirSliderPercentage command while updating");
+              return;
+            }
+            ESP_LOGD("ble", "Triggered airslider action");
             if (id(cAirSliderAutoManual).state) {
               id(write_user_input)->execute({0x62, 0x1E},{(uint8_t)x, 0x00});
             } else {
               ESP_LOGW("main", "Manual mode not enabled");
-              id(cAirSliderPercentage).publish_state(0);
+              //id(cAirSliderPercentage).publish_state(0);
             }
+
 binary_sensor:
   - platform: template
     id: _bDoorOpen
     device_class: door
-    name: "_bDoorOpen"
-
+    name: "Door"
+  - platform: template
+    id: cRefillStatus
+    icon: "mdi:login-variant"
+    name: "Refill"
+    
 sensor:
   - platform: template
     id: cAmbientTemp
@@ -343,8 +452,20 @@ sensor:
       - skip_initial: 2
 
   - platform: template
+    id: BoardTemp
+    name: "Board temperature"
+    icon: "mdi:thermometer"
+    device_class: "temperature"
+    state_class: "measurement"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    filters:
+      - round: 0
+      - skip_initial: 2
+
+  - platform: template
     id: vTcTemp1
-    name: "Stove temperature"
+    name: "Exhaust temperature"
     icon: "mdi:fire"
     device_class: "temperature"
     state_class: "measurement"
@@ -367,68 +488,27 @@ sensor:
 
   - platform: template
     id: cControllerStatus
-    name: "Status"
+    name: "Status Code"
+    disabled_by_default: true
     accuracy_decimals: 0
     filters:
       - round: 0
       - skip_initial: 2
-    on_value:
-      then:
-        - lambda: |-
-            std::string value = "Unknown";
-
-            if (x == 0) {
-              value = "Standby";
-            } else if (x == 1) {
-              value = "Ignition";
-            } else if (x == 2) {
-              value = "Rising";
-            } else if (x == 3) {
-              value = "Falling";
-            } else if (x == 4) {
-              value = "Refill";
-            } else if (x == 5) {
-              value = "Glowing";
-            } else if (x == 6) {
-              value = "No ignition";
-            } else if (x == 7) {
-              value = "Overheated";
-            } else if (x == 8) {
-              value = "Reducing glow";
-            }
-
-            id(cControllerStatusText).publish_state(value);
 
   - platform: template
     id: cMotorError
-    name: "cMotorError"
+    disabled_by_default: true
+    name: "Motor Status Code"
+    icon: "mdi:engine"
     accuracy_decimals: 0
     filters:
       - round: 0
       - skip_initial: 2
-    on_value:
-      then:
-        - lambda: |-
-            std::string value = "Unknown";
-
-            if (x == 0) {
-              value = "OK";
-            } else if (x == 20) {
-              value = "Motor circuit open";
-            } else if (x == 128) {
-              value = "Air slider OK";
-            }
-
-            id(cMotorErrorText).publish_state(value);
 
   - platform: template
     id: cSensorError
-    name: "cSensorError"
-    accuracy_decimals: 0
-
-  - platform: template
-    id: cRefillStatus
-    name: "cRefillStatus"
+    disabled_by_default: true
+    name: "Sensor Error Count"
     accuracy_decimals: 0
 
   - platform: ble_client
@@ -442,48 +522,132 @@ sensor:
     update_interval: never
     lambda: |-
       std::string hex;
+      std::string value;
+
       for (auto b : x) {
         char buf[10];
         sprintf(buf, "%02X ", b);
         hex += buf;
       }
-      ESP_LOGD("ble", "RX data (%d bytes): %s", x.size(), hex.c_str());
 
+      if (id(last_data).size()>1) {
+        if(id(last_data)==x) {
+          ESP_LOGE("ble", "received dup data[%d] (%d bytes): %s", id(current_batch), x.size(), hex.c_str());
+          return true;
+        }
+      } else {
+        if (x[0]==0 && x[1] ==0 && x[2] == 0 && x[3]==0 && x[4]==0 && x[5] ==0 && x[6]==0 && x[7]==0 && x[8]==0 && x[9]==0) {
+          ESP_LOGE("ble", "received zero data[%d] (%d bytes): %s", id(current_batch), x.size(), hex.c_str());
+          return true;
+        }
+      }
+      id(last_data)=x;
+      if (x[3]==254) {
+        ESP_LOGD("ble", "received x[3]=%d for written data (%d bytes): %s",x[3], x.size(), hex.c_str());
+        id(is_writing) = false;
+        return true;
+      }
+      if (id(is_writing)==true) {
+        ESP_LOGD("ble", "received while writing data (%d bytes): %s", x.size(), hex.c_str());
+        id(is_writing) = false;
+        id(is_writing) = false;
+        return true;
+      }
+      if (id(is_polling)==false) {
+        ESP_LOGE("ble", "received while not polling data[%d] (%d bytes): %s", id(current_batch), x.size(), hex.c_str());
+        return true;
+      }
+      ESP_LOGD("ble", "RX data[%d] (%d bytes): %s", id(current_batch), x.size(), hex.c_str());
 
+      id(is_updating) = true;
       switch (id(current_batch)) {
         case 0:
+          if (!id(powerIcon_update)) { // we ignore the first update after updating the value
+            if (x[4] > 0  && x[4] < 5) {
+              id(cPowerIcon).publish_state(((x[5] << 8) | x[4]) - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
+            } else {
+              ESP_LOGE("ble", "received %d for powerIcon, canceling update", x[4]);
+              break;
+            }
+          } else {
+            ESP_LOGE("ble", "skipped update for powerIcon, it was recently updated");
+            id(powerIcon_update) = false;
+          }
           id(cAmbientTemp).publish_state((x[1] << 8) | x[0]);
           id(vTcTemp1).publish_state((x[3] << 8) | x[2]);
-         // POWER ICON VALIDIERUNG
-          {
-          int raw_power = (x[5] << 8) | x[4];
-          if (raw_power >= 1 && raw_power <= 3) {
-          id(cPowerIcon).publish_state(raw_power - 1);
-           } else {
-                 ESP_LOGW("ble_parse", "Ignore invalid Power value: %d", raw_power);
-                  }
-           } // Values are 1, 2 and 3. Start with 0 so we can work with index
           id(cControllerStatus).publish_state((x[7] << 8) | x[6]);
+          value = "Unknown";
+          if (x[6] == 0) {
+            value = "Standby";
+          } else if (x[6] == 1) {
+            value = "Ignition";
+          } else if (x[6] == 2) {
+            value = "Rising";
+          } else if (x[6] == 3) {
+            value = "Falling";
+          } else if (x[6] == 4) {
+            value = "Refill";
+          } else if (x[6] == 5) {
+            value = "Glowing";
+          } else if (x[6] == 6) {
+            value = "No ignition";
+          } else if (x[6] == 7) {
+            value = "Overheated";
+          } else if (x[6] == 8) {
+            value = "Reducing glow";
+          } else if (x[6] == 9) {
+            value = "Chamber flush";
+          }
+          id(cControllerStatusText).publish_state(value);
           id(cAirSlider).publish_state((x[9] << 8) | x[8]);
           break;
         case 1:
           id(cMotorError).publish_state((x[1] << 8) | x[0]);
-          id(cSensorError).publish_state((x[3] << 8) | x[2]);
-          id(cRefillStatus).publish_state((x[5] << 8) | x[4]);
+          value = "Unknown";
+          if (x[0] == 0) {
+            value = "OK";
+          } else if (x[0] == 16) { // wild guess
+            value = "Motor blocked";
+          } else if (x[0] == 20) {
+            value = "Motor circuit open";
+          } else if (x[0] == 64) {
+            value = "Air slider failure"; // wild guess
+          } else if (x[0] == 128) {
+            value = "Air slider OK";
+          }
+          id(cMotorErrorText).publish_state(value);
+          id(BoardTemp).publish_state((x[3] << 8) | x[2]);
+          id(cAirSliderPercentage).publish_state((x[5] << 8) | x[4]);
           id(cAirSliderAutoManual).publish_state(((x[7] << 8) | x[6]) == 1); // 0 off, 1 on
           id(_bDoorOpen).publish_state(((x[9] << 8) | x[8]) == 1); // 0 closed, 1 open
+          if (((x[9] << 8) | x[8]) == 1) {
+            if (id(sezam).position!=COVER_OPEN) {
+              id(sezam).current_operation=COVER_OPERATION_IDLE;
+              id(sezam).position=COVER_OPEN;
+              id(sezam).publish_state();
+            }
+          } else {
+            if (id(sezam).position!=COVER_CLOSED) {
+              id(sezam).current_operation=COVER_OPERATION_IDLE;
+              id(sezam).position=COVER_CLOSED;
+              id(sezam).publish_state();
+            }
+          }
           break;
         case 2:
-          id(cAirSliderPercentage).publish_state((x[1] << 8) | x[0]);
+          id(cRefillStatus).publish_state(((x[1] << 8) | x[0])==1);
+          id(cSensorError).publish_state((x[3] << 8) | x[2]);
           break;
         default:
-          ESP_LOGD("mode", "Unknown current_batch %d", id(current_batch));
+          ESP_LOGE("mode", "Unknown current_batch %d", id(current_batch));
+          return false;
           break;
       }
+      id(is_updating) = false;
 
-      id(is_polling_data) = false;
+      id(is_polling) = false;
 
       id(last_ble_read) = millis() / 1000;  // seconds
       ESP_LOGD("ble_watchdog", "Updated last BLE read: %u", id(last_ble_read));
 
-      return NAN;
+      return true;
