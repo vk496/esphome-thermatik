@@ -218,6 +218,8 @@ script:
             return id(current_data_buffer);
 
   - id: process_batches
+    mode: queued
+    max_runs: 3
     then:
       - lambda: |-
           id(current_index) = 0;
@@ -394,11 +396,9 @@ script:
             id(read_batch_values).stop();
             return;
           }
-      - logger.log: "DEBUG: Start polling"
       - globals.set:
           id: is_polling
           value: "true"
-      - logger.log: "DEBUG: Prepare payload"
       - lambda: |-
           // Ensure we never process more than 5 keys
           if (id(current_chunk).size() > 5) {
@@ -440,12 +440,8 @@ script:
           // 3. Save to buffer
           id(current_address_buffer) = payload;
 
-      - logger.log: "DEBUG: Run BLE ADDR write"
-
       - script.execute: write_ble_to_address
       - script.wait: write_ble_to_address
-
-      - logger.log: "DEBUG: Wait BLE ADDR write"
 
       - wait_until:
           condition:
@@ -462,7 +458,6 @@ script:
                 id: is_polling
                 value: "false"
           else:
-            - logger.log: "DEBUG: Read BLE char"
             - component.update: read_ble_characteristic # No user write request.
 
       - wait_until:
@@ -673,7 +668,7 @@ sensor:
         sprintf(buf, "%02X ", b);
         hex += buf;
       }
-      ESP_LOGD("ble", "RX data(%d bytes): %s", x.size(), hex.c_str());
+      ESP_LOGD("ble", "Read data(%d bytes): %s", x.size(), hex.c_str());
 
 
 
