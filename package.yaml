@@ -2,7 +2,7 @@ substitutions:
   # Expected user input
   mac_address: "" # fail by default
   pincode: 000000
-  fetch_interval: 5s
+  fetch_interval: 7s
 
   # Internal
   MAIN_SERVICE: "0000fff0-0000-1000-8000-00805f9b34fb"
@@ -668,7 +668,6 @@ sensor:
     update_interval: never
     lambda: |-
       std::string hex;
-      std::string value;
       for (auto b : x) {
         char buf[10];
         sprintf(buf, "%02X ", b);
@@ -684,23 +683,26 @@ sensor:
 
       for (size_t i = 0; i < id(current_batch).size(); i++) {
 
-        // NOTE: Transform raw value from Little Endian
         std::string target_batch = id(current_batch)[i];
-        int value = (x[i*2 + 1] << 8) | x[i*2];
+
+        int value_left = x[i*2];
+        int value_right = x[i*2+1];
+        int value_le = (x[i*2+1] << 8) | x[i*2];
+        int value_be = (x[i*2] << 8) | x[i*2+1];
 
 
 
         if ("cAmbientTemp" == target_batch ) {
-          id(cAmbientTemp).publish_state(value);
+          id(cAmbientTemp).publish_state(value_le);
 
         } else if ("vTcTemp1" == target_batch) {
-          id(vTcTemp1).publish_state(value);
+          id(vTcTemp1).publish_state(value_le);
 
         } else if ("FiringMode_0x1CBE" == target_batch) {
-          id(cPowerIcon).publish_state(value - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
+          id(cPowerIcon).publish_state(value_le - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
 
         } else if ("cControllerStatus" == target_batch) {
-          id(cControllerStatus).publish_state(value);
+          id(cControllerStatus).publish_state(value_le);
 
           static const char* STATUS_TEXT[] = {
             "Standby",        // 0
@@ -709,67 +711,67 @@ sensor:
             "Falling",        // 3
             "Refill",         // 4
             "Glowing",        // 5
-            "Chamber flush"   // 6
-            "No ignition",    // 7
-            "Overheated",     // 8
-            "Reducing glow",  // 9
+            "No ignition",    // 6
+            "Overheated",     // 7
+            "Reducing glow",  // 8
+            "Chamber flush"   // 9
           };
 
           const int max_index = sizeof(STATUS_TEXT) / sizeof(STATUS_TEXT[0]);
           const std::string val_text =
-              (x[i*2] >= 0 && x[i*2] < max_index) ? STATUS_TEXT[x[i*2]] : "Unknown";
+              (value_left >= 0 && value_left < max_index) ? STATUS_TEXT[value_left] : "Unknown";
 
           id(cControllerStatusText).publish_state(val_text);
 
         } else if ("cAirSlider" == target_batch) {
-          id(cAirSlider).publish_state(value);
-          id(cAirSliderPercentage).publish_state(value);
+          id(cAirSlider).publish_state(value_le);
+          id(cAirSliderPercentage).publish_state(value_le);
 
         } else if ("BoardTemp" == target_batch) {
-          id(BoardTemp).publish_state(value);
+          id(BoardTemp).publish_state(value_le);
 
         } else if ("_bDoorOpen" == target_batch) {
-          id(_bDoorOpen).publish_state(value == 1); // bool. 0 closed, 1 open
-          if (value == 1 && id(sezam).position != COVER_OPEN) {
+          id(_bDoorOpen).publish_state(value_le == 1); // bool. 0 closed, 1 open
+          if (value_le == 1 && id(sezam).position != COVER_OPEN) {
               id(sezam).current_operation=COVER_OPERATION_IDLE;
               id(sezam).position=COVER_OPEN;
               id(sezam).publish_state();
-          } else if ( value == 0 && id(sezam).position != COVER_CLOSED) {
+          } else if ( value_le == 0 && id(sezam).position != COVER_CLOSED) {
               id(sezam).current_operation=COVER_OPERATION_IDLE;
               id(sezam).position=COVER_CLOSED;
               id(sezam).publish_state();
           }
 
         } else if ("cRefillStatus" == target_batch) {
-          id(cRefillStatus).publish_state(value == 1); // bool. 0 closed, 1 open
+          id(cRefillStatus).publish_state(value_le == 1); // bool. 0 closed, 1 open
 
         } else if ("cSensorError" == target_batch) {
-          id(cSensorError).publish_state(value);
+          id(cSensorError).publish_state(value_le);
 
         } else if ("cAirSliderAutoManual" == target_batch) {
-          id(cAirSliderAutoManual).publish_state(value == 1); // bool. 0 off, 1 on
+          id(cAirSliderAutoManual).publish_state(value_le == 1); // bool. 0 off, 1 on
 
         } else if ("cMotorError" == target_batch) {
           // FIXME: Check if they are actual the correct codes
 
-          id(cMotorError).publish_state(value);
+          id(cMotorError).publish_state(value_le);
           std::string val_text = "Unknown";
-          if (x[i*2] == 0) {
+          if (value_left == 0) {
             val_text = "OK";
-          } else if (x[i*2] == 16) { // wild guess
+          } else if (value_left == 16) { // wild guess
             val_text = "Motor blocked";
-          } else if (x[i*2] == 20) {
+          } else if (value_left == 20) {
             val_text = "Motor circuit open";
-          } else if (x[i*2] == 64) {
+          } else if (value_left == 64) {
             val_text = "Air slider failure"; // wild guess
-          } else if (x[i*2] == 128) {
+          } else if (value_left == 128) {
             val_text = "Air slider OK";
           }
           id(cMotorErrorText).publish_state(val_text);
 
         } else {
-          ESP_LOGE("main", "Unknown case %s (value: %d)", target_batch.c_str(), value);
-          id(dev_sensor_value).publish_state(std::to_string(value));
+          ESP_LOGE("main", "Unknown case %s (value_le: %d)", target_batch.c_str(), value_le);
+          id(dev_sensor_value).publish_state(std::to_string(value_le));
         }
 
       }
