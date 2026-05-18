@@ -10,6 +10,8 @@ substitutions:
   DATA_BUFFER: "0000fff2-0000-1000-8000-00805f9b34fb"
 
 esphome:
+  libraries:
+    - https://github.com/vk496/esphome-thermatik.git#test
   includes:
     - <ble_values.h>
 

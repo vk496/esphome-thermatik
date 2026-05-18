@@ -1,0 +1,13 @@
+{
+    "name": "esphome-thermatik",
+    "version": "1.0.0",
+    "description": "BLE values for Thermatik",
+    "keywords": "ble, esphome",
+    "authors": [
+        {
+            "name": "vk496"
+        }
+    ],
+    "frameworks": "arduino",
+    "platforms": "*"
+}
