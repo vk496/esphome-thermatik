@@ -28,6 +28,7 @@ This package provides a simple way to integrate the controller without custom fi
 packages:
   thermatik:
     url: https://github.com/vk496/esphome-thermatik
+    ref: v1.0.0 # Check in https://github.com/vk496/esphome-thermatik/releases
     files:
       - path: package.yaml
         vars:
