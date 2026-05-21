@@ -34,6 +34,7 @@ packages:
         vars:
           mac_address: "3C:E0:64:XX:XX:XX"
           # pincode: 000000 # Not required unless you changed it from default
+          # FiringModeAttr: "FiringMode_0x1CBE" 
 ```
 
 - Replace `mac_address` with the MAC address of your S-Thermatik NEO controller.

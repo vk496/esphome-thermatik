@@ -4,6 +4,8 @@ substitutions:
   pincode: 000000
   fetch_interval: 7s
 
+  FiringModeAttr: "FiringMode_0x1CBE" # https://github.com/vk496/esphome-thermatik/issues/10
+
   # Internal
   MAIN_SERVICE: "0000fff0-0000-1000-8000-00805f9b34fb"
   ADDRESS_BUFFER: "0000fff1-0000-1000-8000-00805f9b34fb"
@@ -50,6 +52,23 @@ ble_client:
 # Between writes and reads, we need to store which batch we actually waiting
 
 globals:
+  - id: firing_mode_bytes
+    type: std::vector<uint8_t>
+    initial_value: |-
+      []() {
+        // Compile-time validation: '${FiringModeAttr}' must be a known key.
+        // Searches the constexpr HEX_TABLE_RAW directly (get_hex_bytes() is runtime).
+        constexpr bool firing_mode_valid = []() {
+          for (const auto &e : HEX_TABLE_RAW) {
+            if (strcmp(e.name, "${FiringModeAttr}") == 0) return true;
+          }
+          return false;
+        }();
+        static_assert(firing_mode_valid,
+                      "Invalid FiringModeAttr substitution value: not a known key in HEX_TABLE_RAW");
+        return get_hex_bytes("${FiringModeAttr}");
+      }()
+
   - id: last_ble_read
     type: uint32_t
     restore_value: no
@@ -95,7 +114,7 @@ globals:
         "vTcTemp1", 
         "cAmbientTemp",
         "_bDoorOpen",
-        "FiringMode_0x1CBE", 
+        "${FiringModeAttr}", 
         "cAirSlider"
       }
 
@@ -105,7 +124,7 @@ globals:
       {
         "cAmbientTemp",
         "vTcTemp1", 
-        "FiringMode_0x1CBE", 
+        "${FiringModeAttr}", 
         "cControllerStatus", 
         "cAirSlider",
         "cMotorError",
@@ -522,7 +541,7 @@ select:
             // Increase by 1, since server accepts only 1, 2 and 3 as input
             raw_value = raw_value + 1;
 
-            id(write_user_input)->execute(get_hex_bytes("FiringMode_0x1CBE"),{(uint8_t)raw_value, 0x00});
+            id(write_user_input)->execute(get_hex_bytes("${FiringModeAttr}"),{(uint8_t)raw_value, 0x00});
           } else {
             ESP_LOGE("main", "Undefined state. WTF?");
           }
@@ -704,7 +723,7 @@ sensor:
         } else if ("vTcTemp1" == target_batch) {
           id(vTcTemp1).publish_state(value_le);
 
-        } else if ("FiringMode_0x1CBE" == target_batch) {
+        } else if ("${FiringModeAttr}" == target_batch) { // Usually FiringMode_0x1CBE
           id(cPowerIcon).publish_state(value_le - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
 
         } else if ("cControllerStatus" == target_batch) {
