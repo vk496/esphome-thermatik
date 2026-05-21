@@ -478,7 +478,7 @@ text:
   - platform: template
     mode: text
     name: "Dev Sensor Key"
-    id: dev_sensor_key
+    id: DevSensorKeyText
     disabled_by_default: true
     optimistic: true
     on_value:
@@ -499,7 +499,7 @@ text_sensor:
 
   - platform: template
     name: "Dev Sensor Value"
-    id: dev_sensor_value
+    id: DevSensorValueText
     disabled_by_default: true
 
 select:
@@ -687,6 +687,15 @@ sensor:
         int value_le = (x[i*2+1] << 8) | x[i*2];
         int value_be = (x[i*2] << 8) | x[i*2+1];
 
+        // NOTE: If it match the dev sensor key, we publish the value to dev sensor value. 
+        if (id(DevSensorKeyText).state == target_batch) {
+          char buf[64];
+          snprintf(buf, sizeof(buf),
+                  "(%s): %02X %02X | le: %d | be: %d",
+                  target_batch.c_str(), value_left, value_right, value_le, value_be);
+
+          id(DevSensorValueText).publish_state(buf);
+        }
 
 
         if ("cAmbientTemp" == target_batch ) {
@@ -768,7 +777,6 @@ sensor:
 
         } else {
           ESP_LOGE("main", "Unknown case %s (value_le: %d)", target_batch.c_str(), value_le);
-          id(dev_sensor_value).publish_state(std::to_string(value_le));
         }
 
       }
