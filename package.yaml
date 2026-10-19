@@ -3,8 +3,11 @@ substitutions:
   mac_address: "" # fail by default
   pincode: 000000
   fetch_interval: 7s
+  ble_write_settle: 1200ms # APK BLE.writeDelay after ADDRESS and DATA
+  ble_read_settle: 2s # Conservatively retain measured controller response delay
+  ble_response_timeout: 3s # APK operation timeout; timeout forces a clean reconnect
 
-  FiringModeAttr: "FiringMode_0x1CBE" # https://github.com/vk496/esphome-thermatik/issues/10
+  FiringModeAttr: "auto" # Or force FiringMode_0x1C5C / FiringMode_0x1CBE
 
   # Internal
   MAIN_SERVICE: "0000fff0-0000-1000-8000-00805f9b34fb"
@@ -12,16 +15,32 @@ substitutions:
   DATA_BUFFER: "0000fff2-0000-1000-8000-00805f9b34fb"
 
 esphome:
-  libraries:
-    - EsphomeThermatik=https://github.com/vk496/esphome-thermatik.git
+  # Package-relative header paths are supported since ESPHome 2026.9.0.
+  min_version: 2026.9.0
   includes:
-    - <ble_values.h>
+    - src/thermatik_protocol.h
+    - src/ble_values.h
+    - src/thermatik_writer.h
+  on_boot:
+    - priority: 800
+      then:
+        - lambda: |-
+            thermatik::gatt_writer().configure(id(my_ble_device),
+                "${MAIN_SERVICE}", "${ADDRESS_BUFFER}", "${DATA_BUFFER}");
+    - priority: -100
+      then:
+        - lambda: |-
+            ESP_LOGI("thermatik", "Integration ready: controller writes enabled on user request, firing register=%s, poll=${fetch_interval}",
+                     "${FiringModeAttr}");
 
-# Enable logging
+# Compile detailed diagnostics once; change the Thermatik log level at runtime.
 logger:
-  # level: VERY_VERBOSE
+  level: VERBOSE
+  initial_level: INFO
+  runtime_tag_levels: true
   logs:
     esp32_ble_tracker: INFO
+    thermatik: INFO
 
 esp32_ble:
   io_capability: keyboard_display
@@ -33,41 +52,98 @@ ble_client:
     on_connect:
       then:
         - lambda: |-
-            ESP_LOGD("ble_client_lambda", "Connected to BLE device");
+            ESP_LOGI("thermatik", "BLE connected; requesting pairing and starting firmware discovery");
             id(my_ble_device)->pair();
             id(connected)=true;
     on_passkey_request:
       then:
         - lambda: |-
-            ESP_LOGD("ble_client_lambda", "PAIRING BLE passkey request");
+            ESP_LOGD("thermatik", "PAIRING BLE passkey request");
         - ble_client.passkey_reply:
             id: my_ble_device
             passkey: ${pincode}
     on_disconnect:
       then:
         - lambda: |-
-            ESP_LOGD("ble_client_lambda", "Disconnected from BLE device");
+            id(thermatik_diagnostics)[thermatik::DIAG_DISCONNECTS]++;
+            ESP_LOGW("thermatik", "BLE disconnected: tx=%u pending=%d polling=%d user_busy=%d; clearing session",
+                     static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), id(read_pending), id(is_polling), id(is_writing_user));
             id(connected)=false;
+        - script.stop: process_batches
+        - script.stop: read_batch_values
+        - script.stop: write_dev_addr
+        - script.stop: write_user_input
+        - script.stop: user_transaction
+        - script.stop: write_ble_to_address
+        - script.stop: write_ble_to_data
+        - lambda: |-
+            id(device_info_read) = false;
+            id(manual_mode_known) = false;
+            id(mode_value) = 65535;
+            id(firmware_modern) = false;
+            id(sensor_status_value) = 65535;
+            id(last_diagnostics) = 0;
+            if (strcmp("${FiringModeAttr}", "auto") == 0) id(firing_mode_bytes).clear();
+            id(read_pending) = false;
+            id(confirming_write) = false;
+            id(is_polling) = false;
+            id(is_writing_user) = false;
+            id(current_batch).clear();
+            id(current_chunk).clear();
+            id(current_address_buffer).clear();
+            id(current_data_buffer).clear();
 
 # Between writes and reads, we need to store which batch we actually waiting
 
 globals:
+  - id: thermatik_diagnostics
+    type: std::array<uint32_t, 7>
+
   - id: firing_mode_bytes
     type: std::vector<uint8_t>
     initial_value: |-
       []() {
-        // Compile-time validation: '${FiringModeAttr}' must be a known key.
-        // Searches the constexpr HEX_TABLE_RAW directly (get_hex_bytes() is runtime).
-        constexpr bool firing_mode_valid = []() {
-          for (const auto &e : HEX_TABLE_RAW) {
-            if (strcmp(e.name, "${FiringModeAttr}") == 0) return true;
-          }
-          return false;
-        }();
+        // Only these registers are supported heating controls.
+        constexpr bool firing_mode_valid =
+            strcmp("${FiringModeAttr}", "auto") == 0 ||
+            strcmp("${FiringModeAttr}", "FiringMode_0x1C5C") == 0 ||
+            strcmp("${FiringModeAttr}", "FiringMode_0x1CBE") == 0;
         static_assert(firing_mode_valid,
-                      "Invalid FiringModeAttr substitution value: not a known key in HEX_TABLE_RAW");
+                      "FiringModeAttr must be auto, FiringMode_0x1C5C or FiringMode_0x1CBE");
+        if (strcmp("${FiringModeAttr}", "auto") == 0) return std::vector<uint8_t>{};
         return get_hex_bytes("${FiringModeAttr}");
       }()
+
+  - id: confirming_write
+    type: bool
+    initial_value: "false"
+  - id: write_readback_matches
+    type: bool
+    initial_value: "false"
+  - id: expected_write_value
+    type: uint16_t
+    initial_value: "0"
+
+  - id: device_info_read
+    type: bool
+    initial_value: "false"
+  - id: firmware_modern
+    type: bool
+    initial_value: "false"
+  - id: mode_value
+    type: uint16_t
+    initial_value: "65535"
+  - id: manual_mode_known
+    type: bool
+    initial_value: "false"
+  - id: sensor_status_value
+    type: uint16_t
+    initial_value: "65535"
+  - id: poll_cycle
+    type: std::vector<std::string>
+  - id: last_diagnostics
+    type: uint32_t
+    initial_value: "0"
 
   - id: last_ble_read
     type: uint32_t
@@ -91,15 +167,16 @@ globals:
   - id: current_chunk
     type: std::vector<std::string>
 
-  - id: dev_addr_is_good
-    type: bool
-    initial_value: "false"
-
   - id: current_batch
     type: std::vector<std::string>
 
   # Write to ADDR buffer, wait, read from VAL buffer
   - id: is_polling
+    type: bool
+    initial_value: "false"
+
+  # A response is expected only after an explicit characteristic read.
+  - id: read_pending
     type: bool
     initial_value: "false"
 
@@ -114,14 +191,15 @@ globals:
         "vTcTemp1", 
         "cAmbientTemp",
         "_bDoorOpen",
-        "${FiringModeAttr}", 
-        "cAirSlider"
+        "cAirSlider",
+        "BoardTemp"
       }
 
   - id: pool_batches
     type: std::vector<std::string>
     initial_value: |-
       {
+        "cSensorStatus",
         "cAmbientTemp",
         "vTcTemp1", 
         "${FiringModeAttr}", 
@@ -133,55 +211,48 @@ globals:
         "_bDoorOpen",
         "cRefillStatus",
         "cSensorError",
+        "_RelayStatus",
+        "cAirSliderInitialized",
+        "Mode_0x1CD4",
       }
 
 # Main trigger
 interval:
+  - interval: 60s
+    startup_delay: 45s
+    then:
+      - script.execute: log_thermatik_diagnostics
+
   - interval: 3min
     startup_delay: 5min
     then:
       - lambda: |-
-          uint32_t now = millis() / 1000;
+          uint32_t now = millis();
           uint32_t last = id(last_ble_read);
 
           // Handle millis() rollover automatically using subtraction
           uint32_t diff = now - last;
 
-          if (last == 0 || diff > 300) {  // 300s = 5 minutes
-            ESP_LOGE("ble_watchdog", "BLE freeze detected, rebooting...");
+          if (last == 0 || diff > 300000U) {  // 5 minutes
+            ESP_LOGE("thermatik", "BLE freeze detected, rebooting...");
             id(restart_button).press();
           } else {
-            ESP_LOGD("ble_watchdog", "BLE watchdog OK (diff=%u s)", diff);
+            ESP_LOGD("thermatik", "BLE watchdog OK (diff=%u ms)", static_cast<unsigned>(diff));
           }
 
   - interval: ${fetch_interval}
     startup_delay: 30s
     then:
-      - script.execute: process_batches
-
-cover:
-  - platform: template
-    id: sezam
-    name: "Sezam"
-    disabled_by_default: true
-    device_class: garage
-    optimistic: false
-    open_action:
-      - lambda: |-
-          ESP_LOGD("ble", "Triggered Open Door");
-          id(write_user_input)->execute(get_hex_bytes("cSezam"),{0x01, 0x00});
-          id(sezam).current_operation=COVER_OPERATION_OPENING;
-          id(sezam).publish_state();
-    close_action:
-      - lambda: |-
-          ESP_LOGD("ble", "Triggered Close Door");
-          id(write_user_input)->execute(get_hex_bytes("cSezam"),{0x01, 0x00}); // 0x01? Maybe 0x00?
-          id(sezam).current_operation=COVER_OPERATION_CLOSING;
-          id(sezam).publish_state();
+      - if:
+          condition:
+            lambda: "return id(connected) && !id(process_batches).is_running();"
+          then:
+            - script.execute: process_batches
 
 button:
   - platform: template
     name: "Reboot BLE"
+    icon: "mdi:bluetooth-settings"
     device_class: restart # makes it behave like the restart button
     on_press:
       - lambda: id(my_ble_device).set_auto_connect(false); // disable auto connect
@@ -193,6 +264,7 @@ button:
     internal: True
     id: restart_button
     name: "Restart ESP"
+    icon: "mdi:restart"
 
   - platform: template
     name: "Door Remote"
@@ -200,54 +272,121 @@ button:
     disabled_by_default: true
     on_press:
       - lambda: |-
-          ESP_LOGD("ble", "Triggered Door");
+          ESP_LOGD("thermatik", "Triggered Door");
           id(write_user_input)->execute(get_hex_bytes("cSezam"),{0x01, 0x00});
 
+  - platform: template
+    name: "Thermatik diagnostics"
+    icon: "mdi:clipboard-text-search"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: log_thermatik_diagnostics
+
+  - platform: template
+    name: "Save user settings"
+    icon: "mdi:content-save"
+    entity_category: config
+    disabled_by_default: true
+    on_press:
+      - lambda: |-
+          id(write_user_input).execute(get_hex_bytes("cSaveUserData"), {0x01, 0x00});
+
 script:
+  - id: log_thermatik_diagnostics
+    then:
+      - lambda: |-
+          const auto &stats = id(thermatik_diagnostics);
+          const auto &address = id(firing_mode_bytes);
+          ESP_LOGI("thermatik", "Diagnostics: connected=%d firmware_ready=%d pending=%d polling=%d user_busy=%d",
+                   id(connected), id(device_info_read), id(read_pending), id(is_polling), id(is_writing_user));
+          ESP_LOGI("thermatik", "Counters: tx=%u replies=%u malformed=%u unsolicited=%u timeouts=%u disconnects=%u last_reply_age=%u ms",
+                   static_cast<unsigned>(stats[thermatik::DIAG_SEQUENCE]), static_cast<unsigned>(stats[thermatik::DIAG_REPLIES]), static_cast<unsigned>(stats[thermatik::DIAG_MALFORMED]),
+                   static_cast<unsigned>(stats[thermatik::DIAG_UNSOLICITED]), static_cast<unsigned>(stats[thermatik::DIAG_TIMEOUTS]), static_cast<unsigned>(stats[thermatik::DIAG_DISCONNECTS]),
+                   static_cast<unsigned>(millis() - id(last_ble_read)));
+          ESP_LOGI("thermatik", "State: controller=%s bluetooth=%s heating_register=0x%04X mode=%u manual_known=%d manual=%d sensor_flags=0x%04X",
+                   id(controller_version_text).state.c_str(), id(bluetooth_version_text).state.c_str(),
+                   address.size() == 2 ? static_cast<unsigned>((address[1] << 8) | address[0]) : 0,
+                   static_cast<unsigned>(id(mode_value)), id(manual_mode_known), id(cAirSliderAutoManual).state,
+                   static_cast<unsigned>(id(sensor_status_value)));
+
   - id: write_ble_to_address
     then:
-      - ble_client.ble_write:
-          id: my_ble_device
-          service_uuid: ${MAIN_SERVICE}
-          characteristic_uuid: ${ADDRESS_BUFFER}
-          value: !lambda |-
-            std::string hex;
-            for (auto b : id(current_address_buffer)) {
-              char buf[10];
-              sprintf(buf, "%02X ", b);
-              hex += buf;
-            }
-            ESP_LOGD("ble", "Written ADDRESS (%d bytes): %s", id(current_address_buffer).size(), hex.c_str());
-
-            return id(current_address_buffer);
+      - lambda: |-
+          thermatik::gatt_writer().write_address(id(current_address_buffer));
+      - wait_until:
+          condition:
+            lambda: "return thermatik::gatt_writer().done();"
+          timeout: ${ble_response_timeout}
+      - if:
+          condition:
+            lambda: "return !thermatik::gatt_writer().success();"
+          then:
+            - script.execute: abort_ble_transaction
 
   - id: write_ble_to_data
     then:
-      - ble_client.ble_write:
-          id: my_ble_device
-          service_uuid: ${MAIN_SERVICE}
-          characteristic_uuid: ${DATA_BUFFER}
-          value: !lambda |-
-            std::string hex;
-            for (auto b : id(current_data_buffer)) {
-              char buf[10];
-              sprintf(buf, "%02X ", b);
-              hex += buf;
-            }
-            ESP_LOGD("ble", "Written DATA (%d bytes): %s", id(current_data_buffer).size(), hex.c_str());
+      - lambda: |-
+          thermatik::gatt_writer().write_data(id(current_data_buffer));
+      - wait_until:
+          condition:
+            lambda: "return thermatik::gatt_writer().done();"
+          timeout: ${ble_response_timeout}
+      - if:
+          condition:
+            lambda: "return !thermatik::gatt_writer().success();"
+          then:
+            - script.execute: abort_ble_transaction
 
-            return id(current_data_buffer);
-
-  - id: process_batches
-    mode: queued
-    max_runs: 3
+  - id: abort_ble_transaction
     then:
       - lambda: |-
+          if (!thermatik::gatt_writer().done()) id(thermatik_diagnostics)[thermatik::DIAG_TIMEOUTS]++;
+          thermatik::gatt_writer().timeout();
+          ESP_LOGW("thermatik", "TX #%u aborted after BLE operation failure; disconnecting",
+                   static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]));
+          id(connected) = false;
+          id(read_pending) = false;
+          id(confirming_write) = false;
+          id(is_polling) = false;
+          id(is_writing_user) = false;
+          id(current_batch).clear();
+      - script.stop: user_transaction
+      - script.stop: read_batch_values
+      - script.stop: process_batches
+      - ble_client.disconnect: my_ble_device
+
+  - id: process_batches
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: "return !id(device_info_read);"
+          then:
+            - lambda: |-
+                id(current_chunk) = {"cControllerVersion", "cControllerVersion2",
+                                     "cBluetoothVersion", "cBluetoothVersion2", "cBurningModeCount"};
+            - script.execute: read_batch_values
+            - script.wait: read_batch_values
+      - if:
+          condition:
+            lambda: "return !id(connected) || !id(device_info_read);"
+          then:
+            - script.stop: process_batches
+      - lambda: |-
           id(current_index) = 0;
+          id(poll_cycle) = id(pool_batches);
+          const uint32_t now = millis();
+          if (id(last_diagnostics) == 0 || uint32_t(now - id(last_diagnostics)) >= 60000U) {
+            const std::vector<std::string> diagnostics = {
+                "vPtTempDec1", "vPtTempDec2", "vPtTempDec3", "hourCounter", "cFeatureConfig",
+                "RelayFunct1", "RelayFunct2", "RelayFunct3"};
+            id(poll_cycle).insert(id(poll_cycle).end(), diagnostics.begin(), diagnostics.end());
+            id(last_diagnostics) = now;
+          }
 
       - while:
           condition:
-            lambda: "return id(current_index) < id(pool_batches).size();"
+            lambda: "return id(current_index) < id(poll_cycle).size();"
           then:
             - wait_until:
                 condition:
@@ -258,10 +397,10 @@ script:
                 int i = id(current_index);
 
                 // Compute the end index safely
-                int end = std::min(i + chunk_size, (int) id(pool_batches).size());
+                int end = std::min(i + chunk_size, (int) id(poll_cycle).size());
 
                 // Create a chunk vector
-                std::vector<std::string> chunk(id(pool_batches).begin() + i, id(pool_batches).begin() + end);
+                std::vector<std::string> chunk(id(poll_cycle).begin() + i, id(poll_cycle).begin() + end);
 
                 id(current_chunk) = chunk;
 
@@ -276,144 +415,148 @@ script:
       x: string
     then:
       - lambda: |-
-          std::vector<uint8_t> addr = get_hex_bytes(x);
-
-          // PERFORM WRITE ACTION
-
-
-
-          if (addr == std::vector<uint8_t>{0x00, 0x00}) {
-            id(dev_addr_is_good) = false;
-          } else {
-            id(dev_addr_is_good) = true;
+          ESP_LOGD("thermatik", "Developer read requested: %s", x.c_str());
+          auto address = get_hex_bytes(x);
+          if (address == std::vector<uint8_t>{0x00, 0x00}) {
+            ESP_LOGW("thermatik", "Bad developer sensor key: %s", x.c_str());
+            return;
           }
+          id(user_transaction).execute(address, {}, x);
 
-      - if:
-          condition:
-            lambda: "return ! id(dev_addr_is_good);"
-          then:
-            - logger.log: "Bad address value"
-            - script.stop: write_dev_addr
-
-      - globals.set:
-          id: is_writing_user
-          value: "true"
-
-      - wait_until:
-          condition:
-            lambda: "return id(connected) && ! id(is_polling);"
-          timeout: 25s # Deadlock safety
-      - if:
-          condition:
-            lambda: "return !id(connected) || id(is_polling);"
-          then:
-            - logger.log: "Timed out waiting for dev writting"
-            - script.stop: write_dev_addr
-
-      - lambda: |-
-          id(current_address_buffer) = get_hex_bytes(x);
-
-          // Empty vector
-          id(current_batch).clear();
-
-          id(current_batch).insert(id(current_batch).end(), x);
-
-      - script.execute: write_ble_to_address
-      - script.wait: write_ble_to_address
-
-      - delay: 2s
-
-      - globals.set:
-          id: is_polling
-          value: "true"
-
-      - component.update: read_ble_characteristic # No user write request.
-
-      - wait_until:
-          condition:
-            lambda: "return ! id(is_polling);"
-          timeout: 25s # Deadlock safety
-
-      - globals.set:
-          id: is_writing_user
-          value: "false"
-
-  # FIXME: Currently, only 1 of 5 buffer slots is used for user input.
-  # In the future, a script execution should stack them as batch of 5 operations
   - id: write_user_input
+    parameters:
+      address: std::vector<uint8_t>
+      data: std::vector<uint8_t>
+    then:
+      - lambda: |-
+          if (!id(connected) || address.size() != 2 || data.size() != 2 ||
+              address == std::vector<uint8_t>{0x00, 0x00}) {
+            ESP_LOGW("thermatik", "Invalid write command");
+            return;
+          }
+          id(user_transaction).execute(address, data, "");
+
+  # Developer reads and controls share the same queue and address/data ownership.
+  - id: user_transaction
     mode: queued
     max_runs: 5
     parameters:
       address: std::vector<uint8_t>
       data: std::vector<uint8_t>
+      read_key: string
     then:
-      # Indicates a user input is in queue
       - globals.set:
           id: is_writing_user
           value: "true"
-      # Waits to finish any current polling
       - wait_until:
           condition:
-            lambda: "return id(connected) && ! id(is_polling);"
-          timeout: 25s # Deadlock safety
+            lambda: "return !id(connected) || !id(is_polling);"
+      - if:
+          condition:
+            lambda: "return !id(connected) || id(is_polling);"
+          then:
+            - lambda: |-
+                ESP_LOGW("thermatik", "Timed out waiting for user transaction");
+                id(is_writing_user) = false;
+            - script.stop: user_transaction
       - lambda: |-
-          if (!id(connected) || id(is_polling)) {
-            ESP_LOGE("ble", "Timed out waiting for writting %d %d", id(connected), id(is_writing_user));
-            id(write_user_input).stop();
-            return;
-          }
-
-      - lambda: |-
-          std::vector<uint8_t> tx_buffer = address;
-          std::string hex;
-          for (auto b : tx_buffer) {
-            char buf[10];
-            sprintf(buf, "%02X ", b);
-            hex += buf;
-          }
-
+          thermatik::begin_transaction(id(thermatik_diagnostics), millis());
+          ESP_LOGD("thermatik", "TX #%u %s address=0x%04X key=%s",
+                   static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), data.empty() ? "developer read" : "user write",
+                   static_cast<unsigned>((address[1] << 8) | address[0]), read_key.c_str());
+          if (!data.empty() && address == get_hex_bytes("cAirSliderAutoManual")) id(manual_mode_known) = false;
           id(current_address_buffer) = address;
-
+          id(current_batch).clear();
+          id(read_pending) = false;
       - script.execute: write_ble_to_address
       - script.wait: write_ble_to_address
-
-      - delay: 1s
+      - if:
+          condition:
+            lambda: "return !read_key.empty();"
+          then:
+            - delay: ${ble_read_settle}
+            - lambda: |-
+                id(current_batch) = {read_key};
+                id(is_polling) = true;
+                id(read_pending) = true;
+            - component.update: read_ble_characteristic
+            - wait_until:
+                condition:
+                  lambda: "return !id(read_pending);"
+                timeout: ${ble_response_timeout}
+            - if:
+                condition:
+                  lambda: "return id(read_pending);"
+                then:
+                  - lambda: |-
+                      id(thermatik_diagnostics)[thermatik::DIAG_TIMEOUTS]++;
+                      ESP_LOGW("thermatik", "TX #%u developer read timeout: key=%s elapsed=%u ms; reconnecting",
+                               static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), read_key.c_str(),
+                               static_cast<unsigned>(millis() - id(thermatik_diagnostics)[thermatik::DIAG_STARTED_MS]));
+                      id(connected) = false;
+                      id(read_pending) = false;
+                      id(current_batch).clear();
+                  # Flush an unidentifiable late response before the next read.
+                  - ble_client.disconnect: my_ble_device
+            - globals.set:
+                id: is_polling
+                value: "false"
+          else:
+            - delay: ${ble_write_settle}
+            - lambda: |-
+                id(current_data_buffer) = data;
+            - script.execute: write_ble_to_data
+            - script.wait: write_ble_to_data
+            - delay: ${ble_write_settle}
+            - lambda: |-
+                id(current_batch).clear();
+                if (address == get_hex_bytes("cAirSliderAutoManual")) id(current_batch) = {"cAirSliderAutoManual"};
+                else if (address == get_hex_bytes("cAirSlider")) id(current_batch) = {"cAirSlider"};
+                else if (address == id(firing_mode_bytes)) id(current_batch) = {"${FiringModeAttr}"};
+                id(expected_write_value) = (data[1] << 8) | data[0];
+                id(write_readback_matches) = false;
+            - if:
+                condition:
+                  lambda: "return !id(current_batch).empty();"
+                then:
+                  # Request a fresh register value instead of relying on the DATA buffer left by the write.
+                  - script.execute: write_ble_to_address
+                  - script.wait: write_ble_to_address
+                  - delay: ${ble_read_settle}
+                  - lambda: |-
+                      id(confirming_write) = true;
+                      id(read_pending) = true;
+                      id(is_polling) = true;
+                      ESP_LOGD("thermatik", "TX #%u immediate readback: key=%s expected=%u",
+                               static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]),
+                               id(current_batch)[0].c_str(), static_cast<unsigned>(id(expected_write_value)));
+                  - component.update: read_ble_characteristic
+                  - wait_until:
+                      condition:
+                        lambda: "return !id(read_pending);"
+                      timeout: ${ble_response_timeout}
+                  - if:
+                      condition:
+                        lambda: "return id(read_pending);"
+                      then:
+                        - lambda: |-
+                            id(thermatik_diagnostics)[thermatik::DIAG_TIMEOUTS]++;
+                            ESP_LOGW("thermatik", "Write readback timed out");
+                        - script.execute: abort_ble_transaction
 
       - lambda: |-
-          id(current_data_buffer) = data;
-
-      - script.execute: write_ble_to_data
-      - script.wait: write_ble_to_data
-      - delay: 400ms
-
-      # - globals.set: # we cancel the poll results, as the write command will interfere
-      #     id: is_polling
-      #     value: "false"
-
-      # - delay: 2s # On my tests, values are not populated if you read too fast. 2s was the minimum reliable
-
-      # Translate data to actual user input and trigger sensors
-      # - component.update: read_ble_characteristic
-
-      # - wait_until:
-      #     condition:
-      #       lambda: "return ! id(is_writing_user);"
-      #     timeout: 15s
-      - lambda: |-
-          ESP_LOGD("ble", "Writing command is done");
-      - globals.set:
-          id: is_writing_user
-          value: "false"
+          id(current_batch).clear();
+          id(is_writing_user) = false;
+          ESP_LOGD("thermatik", "User transaction complete");
 
   - id: read_batch_values
     then:
       - wait_until:
           condition:
-            lambda: "return id(connected) && ! id(is_writing_user);"
-          timeout: 25s
+            lambda: "return !id(connected) || !id(is_writing_user);"
       - lambda: |-
           if (!id(connected) || id(is_writing_user)) {
-            ESP_LOGE("main", "Timed out for read batch %d %d", id(connected), id(is_writing_user));
+            ESP_LOGE("thermatik", "Timed out for read batch %d %d", id(connected), id(is_writing_user));
             id(read_batch_values).stop();
             return;
           }
@@ -423,7 +566,7 @@ script:
       - lambda: |-
           // Ensure we never process more than 5 keys
           if (id(current_chunk).size() > 5) {
-            ESP_LOGW("main", "Resizing chunk because it was %d length", id(current_chunk).size());
+            ESP_LOGW("thermatik", "Resizing chunk because it was %d length", id(current_chunk).size());
             id(current_chunk).resize(5);
           }
 
@@ -435,27 +578,27 @@ script:
           std::vector<uint8_t> payload;
           payload.reserve(5 * 2);  // 5 elements * 2 bytes each
 
-          // 1. Add provided keys
+          // Resolve the firmware-dependent power register after the version probe.
           for (const auto &k : id(current_chunk)) {
-              auto bytes = get_hex_bytes(k);   // must return exactly 2 bytes
-              payload.insert(payload.end(), bytes.begin(), bytes.end());
-              id(current_batch).insert(id(current_batch).end(), k);
-              
+            auto bytes = get_read_bytes(k, id(firmware_modern), id(firing_mode_bytes), "${FiringModeAttr}");
+            if (k == "Mode_0x1CD4" && !id(firmware_modern)) continue;
+            if (bytes.size() != 2 || bytes == std::vector<uint8_t>{0, 0}) continue;
+            payload.insert(payload.end(), bytes.begin(), bytes.end());
+            id(current_batch).push_back(k);
           }
-
-          // 2. Pad with default keys if needed
-          for (size_t i = id(current_chunk).size(); i < 5; i++) {
-              auto bytes = get_hex_bytes(id(fallback_fill_5_elements)[i]);
-              payload.insert(payload.end(), bytes.begin(), bytes.end());
-              id(current_batch).insert(id(current_batch).end(), id(fallback_fill_5_elements)[i]);
+          // Pad the address buffer with safe, firmware-independent reads.
+          for (size_t i = id(current_batch).size(); i < 5; i++) {
+            auto bytes = get_hex_bytes(id(fallback_fill_5_elements)[i]);
+            payload.insert(payload.end(), bytes.begin(), bytes.end());
+            id(current_batch).push_back(id(fallback_fill_5_elements)[i]);
           }
-
 
           std::string joined;
           for (const auto &s : id(current_batch)) {
               joined += s + ", ";
           }
-          ESP_LOGI("main", "Processing chunk: [%s]", joined.c_str());
+          thermatik::begin_transaction(id(thermatik_diagnostics), millis());
+          ESP_LOGD("thermatik", "TX #%u poll [%s]", static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), joined.c_str());
 
 
           // 3. Save to buffer
@@ -464,40 +607,55 @@ script:
       - script.execute: write_ble_to_address
       - script.wait: write_ble_to_address
 
-      - wait_until:
-          condition:
-            lambda: "return id(is_writing_user);"
-          # NOTE: # On my tests, values are not populated if you read too fast. 2s was the minimum reliable
-          timeout: 2s # Device take time to process. Wait meanwhile
+      # Allow the controller to populate DATA before yielding or reading.
+      - delay: ${ble_read_settle}
 
       - if:
           condition:
             lambda: "return id(is_writing_user);"
           then:
-            - logger.log: "User requested write data. Cancelling poll"
+            - logger.log:
+                tag: thermatik
+                level: DEBUG
+                format: "User transaction requested; yielding before read"
             - globals.set:
                 id: is_polling
                 value: "false"
           else:
-            - component.update: read_ble_characteristic # No user write request.
+            - globals.set:
+                id: read_pending
+                value: "true"
+            - component.update: read_ble_characteristic
 
       - wait_until:
           condition:
             lambda: "return ! id(is_polling);"
-          timeout: 25s # Deadlock safety
+          timeout: ${ble_response_timeout} # Deadlock safety
 
-        # Finish anyway in case of timeout
+      - if:
+          condition:
+            lambda: "return id(read_pending);"
+          then:
+            - lambda: |-
+                id(thermatik_diagnostics)[thermatik::DIAG_TIMEOUTS]++;
+                ESP_LOGW("thermatik", "TX #%u poll timeout: slots=%u elapsed=%u ms; reconnecting",
+                         static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), static_cast<unsigned>(id(current_batch).size()),
+                         static_cast<unsigned>(millis() - id(thermatik_diagnostics)[thermatik::DIAG_STARTED_MS]));
+                id(connected) = false;
+                id(read_pending) = false;
+                id(current_batch).clear();
+            # A late response cannot be associated with a new address batch.
+            - ble_client.disconnect: my_ble_device
       - lambda: |-
-          if (id(is_polling)) {
-            ESP_LOGE("main", "poll not done in 25s");
-            id(is_polling) = false;
-          }
+          id(is_polling) = false;
+          id(current_batch).clear();
 
 text:
   - platform: template
     mode: text
     name: "Dev Sensor Key"
     id: DevSensorKeyText
+    icon: "mdi:database-search"
     disabled_by_default: true
     optimistic: true
     on_value:
@@ -519,7 +677,48 @@ text_sensor:
   - platform: template
     name: "Dev Sensor Value"
     id: DevSensorValueText
+    icon: "mdi:database-eye"
     disabled_by_default: true
+
+  - platform: template
+    id: sensor_error_description
+    icon: "mdi:alert-circle-outline"
+    name: "Sensor errors"
+    entity_category: diagnostic
+  - platform: template
+    id: controller_version_text
+    icon: "mdi:chip"
+    name: "Controller firmware"
+    entity_category: diagnostic
+  - platform: template
+    id: bluetooth_version_text
+    icon: "mdi:bluetooth"
+    name: "Bluetooth firmware"
+    entity_category: diagnostic
+  - platform: template
+    id: burning_mode_text
+    icon: "mdi:fireplace"
+    name: "Burning mode"
+    entity_category: diagnostic
+  - platform: template
+    id: relay_1_function
+    name: "Relay 1 function"
+    icon: "mdi:cog-outline"
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: template
+    id: relay_2_function
+    name: "Relay 2 function"
+    icon: "mdi:cog-outline"
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: template
+    id: relay_3_function
+    name: "Relay 3 function"
+    icon: "mdi:cog-outline"
+    entity_category: diagnostic
+    disabled_by_default: true
+
 
 select:
   - platform: template
@@ -530,10 +729,16 @@ select:
       - "Low"
       - "Mid"
       - "High"
-    optimistic: true
+    optimistic: false
     set_action:
       - lambda: |-
-          ESP_LOGD("ble", "Triggered set powerIcon action");
+          ESP_LOGD("thermatik", "Triggered set powerIcon action");
+          if (!id(connected) || id(firing_mode_bytes).empty() ||
+              !id(manual_mode_known) || id(user_transaction).is_running() ||
+              id(cAirSliderAutoManual).state || id(mode_value) != 3) {
+            ESP_LOGW("thermatik", "Heating requires automatic control and normal burning mode");
+            return;
+          }
           auto index = id(cPowerIcon).index_of(x);
           if (index.has_value()) {
             int raw_value = index.value();
@@ -541,30 +746,51 @@ select:
             // Increase by 1, since server accepts only 1, 2 and 3 as input
             raw_value = raw_value + 1;
 
-            id(write_user_input)->execute(get_hex_bytes("${FiringModeAttr}"),{(uint8_t)raw_value, 0x00});
+            id(write_user_input)->execute(id(firing_mode_bytes),{(uint8_t)raw_value, 0x00});
           } else {
-            ESP_LOGE("main", "Undefined state. WTF?");
+            ESP_LOGE("thermatik", "Invalid heating option");
           }
+
+  - platform: template
+    id: thermatik_log_level
+    name: "Thermatik log level"
+    entity_category: diagnostic
+    icon: "mdi:text-box-search"
+    optimistic: true
+    initial_option: "INFO"
+    restore_value: false
+    options:
+      - "INFO"
+      - "DEBUG"
+      - "VERBOSE"
+    set_action:
+      - lambda: |-
+          const uint8_t level = x == "VERBOSE" ? ESPHOME_LOG_LEVEL_VERBOSE :
+                                x == "DEBUG" ? ESPHOME_LOG_LEVEL_DEBUG : ESPHOME_LOG_LEVEL_INFO;
+          esphome::logger::global_logger->set_log_level("thermatik", level);
+          ESP_LOGI("thermatik", "Runtime log level=%s (INFO summaries, DEBUG decoded registers, VERBOSE raw BLE frames)", x.c_str());
 
 switch:
   - platform: template
     id: cAirSliderAutoManual
-    optimistic: true
+    icon: "mdi:hand-back-right"
+    optimistic: false
     name: "Air Slider Manual mode"
-    on_turn_on:
+    turn_on_action:
       - lambda: |-
           if (id(connected)) {
-            ESP_LOGD("ble", "Turned manual slider ON");
+            id(manual_mode_known) = false;
+            ESP_LOGD("thermatik", "Turned manual slider ON");
             id(write_user_input)->execute(get_hex_bytes("cAirSliderAutoManual"),{0x01, 0x00});
           }
-    on_turn_off:
+    turn_off_action:
       - lambda: |-
-          if (id(connected)) { // when the entity is initialized, this function is triggered
-            ESP_LOGD("ble", "Turned manual slider OFF");
+          if (id(connected)) {
+            id(manual_mode_known) = false;
+            ESP_LOGD("thermatik", "Turned manual slider OFF");
             id(write_user_input)->execute(get_hex_bytes("cAirSliderAutoManual"),{0x00, 0x00});
           }
 
-# TODO: Implement a read operation
 number:
   - platform: template
     id: cAirSliderPercentage
@@ -577,14 +803,13 @@ number:
     set_action:
       then:
         - lambda: |-
-            ESP_LOGD("ble", "Triggered airslider action");
-            if (id(cAirSliderAutoManual).state) {
+            ESP_LOGD("thermatik", "Triggered airslider action");
+            if (id(connected) && id(manual_mode_known) && !id(user_transaction).is_running() &&
+                id(cAirSliderAutoManual).state) {
               id(write_user_input)->execute(get_hex_bytes("cAirSlider"),{(uint8_t)x, 0x00});
 
-              //Assume it will actually change it
-              id(cAirSliderPercentage).publish_state(x);
             } else {
-              ESP_LOGW("main", "Manual mode not enabled");
+              ESP_LOGW("thermatik", "Manual mode not enabled");
 
               // Restore to previous
               id(cAirSliderPercentage).publish_state(id(cAirSlider).state);
@@ -593,12 +818,39 @@ number:
 binary_sensor:
   - platform: template
     id: _bDoorOpen
+    icon: "mdi:door"
     device_class: door
     name: "Door"
   - platform: template
     id: cRefillStatus
     icon: "mdi:login-variant"
     name: "Refill"
+
+  - platform: template
+    id: air_slider_initialized
+    icon: "mdi:check-circle-outline"
+    name: "Air slider initialized"
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: template
+    id: relay_1_active
+    name: "Relay 1 active"
+    icon: "mdi:electric-switch"
+    device_class: running
+    disabled_by_default: true
+  - platform: template
+    id: relay_2_active
+    name: "Relay 2 active"
+    icon: "mdi:electric-switch"
+    device_class: running
+    disabled_by_default: true
+  - platform: template
+    id: relay_3_active
+    name: "Relay 3 active"
+    icon: "mdi:electric-switch"
+    device_class: running
+    disabled_by_default: true
+
 
 sensor:
   - platform: template
@@ -650,6 +902,7 @@ sensor:
 
   - platform: template
     id: cControllerStatus
+    icon: "mdi:fireplace"
     name: "Status Code"
     disabled_by_default: true
     accuracy_decimals: 0
@@ -669,14 +922,73 @@ sensor:
 
   - platform: template
     id: cSensorError
+    icon: "mdi:alert-circle-outline"
     disabled_by_default: true
-    name: "Sensor Error Count"
+    name: "Sensor Error Flags"
+    accuracy_decimals: 0
+
+  - platform: template
+    id: cSensorStatus
+    icon: "mdi:information-outline"
+    name: "Sensor Status Flags"
+    entity_category: diagnostic
+    disabled_by_default: true
+    accuracy_decimals: 0
+  - platform: template
+    id: pt_temperature_1
+    icon: "mdi:thermometer"
+    name: "PT1 temperature"
+    disabled_by_default: true
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    id: pt_temperature_2
+    icon: "mdi:thermometer"
+    name: "PT2 temperature"
+    disabled_by_default: true
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    id: pt_temperature_3
+    icon: "mdi:thermometer"
+    name: "PT3 temperature"
+    disabled_by_default: true
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    id: operating_hours
+    icon: "mdi:clock-outline"
+    name: "Operating hours"
+    entity_category: diagnostic
+    disabled_by_default: true
+    unit_of_measurement: h
+    accuracy_decimals: 0
+  - platform: template
+    id: relay_status
+    icon: "mdi:electric-switch"
+    name: "Relay Status Flags"
+    entity_category: diagnostic
+    disabled_by_default: true
+    accuracy_decimals: 0
+  - platform: template
+    id: feature_config
+    icon: "mdi:cog-outline"
+    name: "Feature configuration"
+    entity_category: diagnostic
+    disabled_by_default: true
     accuracy_decimals: 0
 
   - platform: ble_client
     type: characteristic
     ble_client_id: my_ble_device
     id: read_ble_characteristic
+    icon: "mdi:bluetooth-transfer"
     internal: true
     name: "RX stream"
     service_uuid: ${MAIN_SERVICE}
@@ -689,14 +1001,58 @@ sensor:
         sprintf(buf, "%02X ", b);
         hex += buf;
       }
-      ESP_LOGD("ble", "Read data(%d bytes): %s", x.size(), hex.c_str());
+      ESP_LOGV("thermatik", "RX #%u %u bytes: %s", static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]),
+               static_cast<unsigned>(x.size()), hex.c_str());
 
 
 
-      // NOTE: This is a ble_client to read a characteristic, the data comes from x
-      // NOTE2: This callback is used to populate dev inputs too, so we cant break execution based on is_writing_user
+      // ESPHome also reads on connection. Only consume our own pending reads.
+      if (!id(connected) || !id(read_pending)) {
+        id(thermatik_diagnostics)[thermatik::DIAG_UNSOLICITED]++;
+        ESP_LOGD("thermatik", "Ignoring unsolicited RX: connected=%d pending=%d bytes=%u",
+                 id(connected), id(read_pending), static_cast<unsigned>(x.size()));
+        return NAN;
+      }
+      id(read_pending) = false;
+      const size_t batch_size = id(current_batch).size();
+      if (batch_size == 0 || batch_size > 5 || x.size() < batch_size * 2) {
+        id(thermatik_diagnostics)[thermatik::DIAG_MALFORMED]++;
+        ESP_LOGW("thermatik", "Invalid BLE response length: %u bytes for %u keys",
+                 static_cast<unsigned>(x.size()), static_cast<unsigned>(batch_size));
+        id(is_polling) = false;
+        id(confirming_write) = false;
+        id(current_batch).clear();
+        return NAN;
+      }
 
 
+      id(thermatik_diagnostics)[thermatik::DIAG_REPLIES]++;
+      ESP_LOGD("thermatik", "RX #%u matched %u slots in %u ms",
+               static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), static_cast<unsigned>(batch_size),
+               static_cast<unsigned>(millis() - id(thermatik_diagnostics)[thermatik::DIAG_STARTED_MS]));
+      const bool is_confirmation = id(confirming_write);
+      if (is_confirmation) {
+        const uint16_t actual = (x[1] << 8) | x[0];
+        id(write_readback_matches) = batch_size == 1 && actual == id(expected_write_value);
+        if (id(write_readback_matches)) ESP_LOGI("thermatik", "TX #%u readback confirmed: %s=%u elapsed=%u ms",
+            static_cast<unsigned>(id(thermatik_diagnostics)[thermatik::DIAG_SEQUENCE]), id(current_batch)[0].c_str(),
+            static_cast<unsigned>(actual), static_cast<unsigned>(millis() - id(thermatik_diagnostics)[thermatik::DIAG_STARTED_MS]));
+        else ESP_LOGW("thermatik", "Readback differs: %s expected=%u actual=%u; publishing actual controller state",
+            id(current_batch)[0].c_str(), static_cast<unsigned>(id(expected_write_value)), static_cast<unsigned>(actual));
+      }
+      // Availability can follow a temperature in the same response. Decode it first.
+      for (size_t i = 0; i < batch_size; ++i) {
+        if (id(current_batch)[i] == "cSensorStatus") {
+          id(sensor_status_value) = (x[2*i+1] << 8) | x[2*i];
+          if (!thermatik::sensor_available(id(sensor_status_value), 4)) id(cAmbientTemp).publish_state(NAN);
+          if (!thermatik::sensor_available(id(sensor_status_value), 0)) id(pt_temperature_1).publish_state(NAN);
+          if (!thermatik::sensor_available(id(sensor_status_value), 1)) id(pt_temperature_2).publish_state(NAN);
+          if (!thermatik::sensor_available(id(sensor_status_value), 2)) id(pt_temperature_3).publish_state(NAN);
+        }
+      }
+      uint16_t controller_low = 0, controller_high = 0, bluetooth_low = 0, bluetooth_high = 0;
+      bool have_controller_low = false, have_controller_high = false;
+      bool have_bluetooth_low = false, have_bluetooth_high = false;
       for (size_t i = 0; i < id(current_batch).size(); i++) {
 
         std::string target_batch = id(current_batch)[i];
@@ -706,103 +1062,165 @@ sensor:
         int value_le = (x[i*2+1] << 8) | x[i*2];
         int value_be = (x[i*2] << 8) | x[i*2+1];
 
-        // NOTE: If it match the dev sensor key, we publish the value to dev sensor value. 
+        const auto register_bytes = get_read_bytes(target_batch, id(firmware_modern), id(firing_mode_bytes), "${FiringModeAttr}");
+        const unsigned register_address = register_bytes.size() == 2 ? (register_bytes[1] << 8) | register_bytes[0] : 0;
+        ESP_LOGD("thermatik", "  [%u] %s @0x%04X raw=0x%04X u16=%u s16=%d",
+                 static_cast<unsigned>(i), target_batch.c_str(), register_address, static_cast<unsigned>(value_le),
+                 static_cast<unsigned>(value_le), static_cast<int>(thermatik::signed_word(value_le)));
+
+        // Developer output remains raw and includes both endian interpretations.
         if (id(DevSensorKeyText).state == target_batch) {
-          char buf[64];
+          char buf[128];
           snprintf(buf, sizeof(buf),
-                  "(%s): %02X %02X | le: %d | be: %d",
-                  target_batch.c_str(), value_left, value_right, value_le, value_be);
+                  "(%s): %02X %02X | le: %d | s16: %d | be: %d",
+                  target_batch.c_str(), value_left, value_right, value_le, static_cast<int>(thermatik::signed_word(value_le)), value_be);
 
           id(DevSensorValueText).publish_state(buf);
         }
 
 
         if ("cAmbientTemp" == target_batch ) {
-          id(cAmbientTemp).publish_state(value_le);
+          const bool available = thermatik::sensor_available(id(sensor_status_value), 4);
+          id(cAmbientTemp).publish_state(available ? thermatik::signed_word(value_le) : NAN);
+          ESP_LOGD("thermatik", "  Ambient=%s sensor_status=0x%04X", available ? "available" : "unavailable", id(sensor_status_value));
 
         } else if ("vTcTemp1" == target_batch) {
-          id(vTcTemp1).publish_state(value_le);
+          id(vTcTemp1).publish_state(thermatik::signed_word(value_le));
 
         } else if ("${FiringModeAttr}" == target_batch) { // Usually FiringMode_0x1CBE
-          id(cPowerIcon).publish_state(value_le - 1); // Values are 1, 2 and 3. Start with 0 so we can work with index
+          if (value_le >= 1 && value_le <= 3) {
+            id(cPowerIcon).publish_state(static_cast<size_t>(value_le - 1));
+          } else {
+            ESP_LOGW("thermatik", "Invalid firing mode: %d", value_le);
+          }
 
         } else if ("cControllerStatus" == target_batch) {
           id(cControllerStatus).publish_state(value_le);
 
-          static const char* STATUS_TEXT[] = {
-            "Standby",        // 0
-            "Ignition",       // 1
-            "Rising",         // 2
-            "Falling",        // 3
-            "Refill",         // 4
-            "Glowing",        // 5
-            "No ignition",    // 6
-            "Overheated",     // 7
-            "Reducing glow",  // 8
-            "Chamber flush"   // 9
-          };
-
-          const int max_index = sizeof(STATUS_TEXT) / sizeof(STATUS_TEXT[0]);
-          const std::string val_text =
-              (value_left >= 0 && value_left < max_index) ? STATUS_TEXT[value_left] : "Unknown";
-
-          id(cControllerStatusText).publish_state(val_text);
+          ESP_LOGD("thermatik", "  controller state=%s", thermatik::controller_status_text(value_le));
+          id(cControllerStatusText).publish_state(thermatik::controller_status_text(value_le));
 
         } else if ("cAirSlider" == target_batch) {
           id(cAirSlider).publish_state(value_le);
           id(cAirSliderPercentage).publish_state(value_le);
 
         } else if ("BoardTemp" == target_batch) {
-          id(BoardTemp).publish_state(value_le);
+          id(BoardTemp).publish_state(thermatik::signed_word(value_le));
 
         } else if ("_bDoorOpen" == target_batch) {
           id(_bDoorOpen).publish_state(value_le == 1); // bool. 0 closed, 1 open
-          if (value_le == 1 && id(sezam).position != COVER_OPEN) {
-              id(sezam).current_operation=COVER_OPERATION_IDLE;
-              id(sezam).position=COVER_OPEN;
-              id(sezam).publish_state();
-          } else if ( value_le == 0 && id(sezam).position != COVER_CLOSED) {
-              id(sezam).current_operation=COVER_OPERATION_IDLE;
-              id(sezam).position=COVER_CLOSED;
-              id(sezam).publish_state();
-          }
 
         } else if ("cRefillStatus" == target_batch) {
           id(cRefillStatus).publish_state(value_le == 1); // bool. 0 closed, 1 open
 
         } else if ("cSensorError" == target_batch) {
           id(cSensorError).publish_state(value_le);
+          ESP_LOGD("thermatik", "  sensor faults=%s (home mask=0x7838)", thermatik::sensor_error_text(value_le).c_str());
+          id(sensor_error_description).publish_state(thermatik::sensor_error_text(value_le));
 
         } else if ("cAirSliderAutoManual" == target_batch) {
-          id(cAirSliderAutoManual).publish_state(value_le == 1); // bool. 0 off, 1 on
+          if (value_le == 0 || value_le == 1) {
+            id(cAirSliderAutoManual).publish_state(value_le == 1);
+            id(manual_mode_known) = is_confirmation || !id(user_transaction).is_running();
+          }
 
         } else if ("cMotorError" == target_batch) {
-          // FIXME: Check if they are actual the correct codes
-
           id(cMotorError).publish_state(value_le);
-          std::string val_text = "Unknown";
-          if (value_left == 0) {
-            val_text = "OK";
-          } else if (value_left == 16) { // wild guess
-            val_text = "Motor blocked";
-          } else if (value_left == 20) {
-            val_text = "Motor circuit open";
-          } else if (value_left == 64) {
-            val_text = "Air slider failure"; // wild guess
-          } else if (value_left == 128) {
-            val_text = "Air slider OK";
-          }
-          id(cMotorErrorText).publish_state(val_text);
+          ESP_LOGD("thermatik", "  motor status=%s (home mask=0x00C7)", thermatik::motor_status_text(value_le).c_str());
+          id(cMotorErrorText).publish_state(thermatik::motor_status_text(value_le));
 
-        } else {
-          ESP_LOGE("main", "Unknown case %s (value_le: %d)", target_batch.c_str(), value_le);
+        } else if ("cControllerVersion" == target_batch) {
+          controller_low = value_le;
+          have_controller_low = true;
+        } else if ("cControllerVersion2" == target_batch) {
+          controller_high = value_le;
+          have_controller_high = true;
+        } else if ("cBluetoothVersion" == target_batch) {
+          bluetooth_low = value_le;
+          have_bluetooth_low = true;
+        } else if ("cBluetoothVersion2" == target_batch) {
+          bluetooth_high = value_le;
+          have_bluetooth_high = true;
+        } else if ("cBurningModeCount" == target_batch) {
+          // Bit 15 is the product-prefix flag; it is not the selected burning mode.
+          ESP_LOGD("thermatik", "Burning mode count/product flags: 0x%04X", value_le);
+        } else if ("Mode_0x1CD4" == target_batch) {
+          id(mode_value) = value_le;
+          static const char *const modes[] = {"TUV part load", "TUV full load", "Blue Angel", "Normal"};
+          id(burning_mode_text).publish_state(value_le < 4 ? modes[value_le] : "Unknown");
+        } else if ("cSensorStatus" == target_batch) {
+          id(sensor_status_value) = value_le;
+          id(cSensorStatus).publish_state(value_le);
+        } else if ("cAirSliderInitialized" == target_batch) {
+          id(air_slider_initialized).publish_state(value_le == 1);
+        } else if ("vPtTempDec1" == target_batch || "vPtTempDec2" == target_batch ||
+                   "vPtTempDec3" == target_batch) {
+          const int channel = target_batch.back() - '1';
+          const bool available = thermatik::sensor_available(id(sensor_status_value), channel);
+          const float temperature = available ? thermatik::signed_word(value_le) / 10.0f : NAN;
+          ESP_LOGD("thermatik", "  PT%d=%s decoded=%.1f C sensor_status=0x%04X", channel + 1,
+                   available ? "available" : "unavailable", temperature, static_cast<unsigned>(id(sensor_status_value)));
+          if (channel == 0) id(pt_temperature_1).publish_state(temperature);
+          if (channel == 1) id(pt_temperature_2).publish_state(temperature);
+          if (channel == 2) id(pt_temperature_3).publish_state(temperature);
+        } else if ("hourCounter" == target_batch) {
+          id(operating_hours).publish_state(value_le);
+        } else if ("_RelayStatus" == target_batch) {
+          id(relay_status).publish_state(value_le);
+          id(relay_1_active).publish_state((value_le & 1) != 0);
+          id(relay_2_active).publish_state((value_le & 2) != 0);
+          id(relay_3_active).publish_state((value_le & 4) != 0);
+          ESP_LOGD("thermatik", "  Relays 1/2/3=%d/%d/%d", (value_le & 1) != 0, (value_le & 2) != 0, (value_le & 4) != 0);
+        } else if (target_batch == "RelayFunct1" || target_batch == "RelayFunct2" || target_batch == "RelayFunct3") {
+          const char *function = thermatik::relay_function_text(value_le);
+          if (target_batch == "RelayFunct1") id(relay_1_function).publish_state(function);
+          if (target_batch == "RelayFunct2") id(relay_2_function).publish_state(function);
+          if (target_batch == "RelayFunct3") id(relay_3_function).publish_state(function);
+          ESP_LOGD("thermatik", "  %s=%s (raw=%u)", target_batch.c_str(), function, value_le);
+        } else if ("cFeatureConfig" == target_batch) {
+          id(feature_config).publish_state(value_le);
+
+        } else if (id(DevSensorKeyText).state != target_batch) {
+          ESP_LOGW("thermatik", "Unhandled poll key %s (value: %d)", target_batch.c_str(), value_le);
         }
 
       }
 
+      if (have_controller_low && have_controller_high) {
+        const auto version = thermatik::firmware_version(controller_low, controller_high);
+        if (version.valid()) {
+          id(controller_version_text).publish_state(version.text());
+          id(device_info_read) = true;
+          id(firmware_modern) = version.modern_registers();
+          if (strcmp("${FiringModeAttr}", "auto") == 0) {
+            id(firing_mode_bytes) = get_hex_bytes(id(firmware_modern) ? "FiringMode_0x1CBE" : "FiringMode_0x1C5C");
+          }
+          const auto &address = id(firing_mode_bytes);
+          ESP_LOGI("thermatik", "Controller firmware=%s raw=%04X:%04X flags=0x%02X layout=%s heating_register=0x%04X selection=${FiringModeAttr}",
+                   version.text().c_str(), controller_high, controller_low, version.flags,
+                   id(firmware_modern) ? ">=1.15.0" : "legacy",
+                   address.size() == 2 ? static_cast<unsigned>((address[1] << 8) | address[0]) : 0);
+          // Old firmware does not use the newer certification-mode register.
+          if (!id(firmware_modern)) {
+            id(mode_value) = 3;
+            id(burning_mode_text).publish_state("Normal");
+          }
+        } else {
+          id(controller_version_text).publish_state("Unknown");
+          ESP_LOGW("thermatik", "Invalid controller firmware words: %04X %04X", controller_low, controller_high);
+        }
+      }
+      if (have_bluetooth_low && have_bluetooth_high) {
+        const auto version = thermatik::firmware_version(bluetooth_low, bluetooth_high);
+        ESP_LOGI("thermatik", "Bluetooth firmware=%s raw=%04X:%04X", version.valid() ? version.text().c_str() : "Unknown",
+                 bluetooth_high, bluetooth_low);
+        id(bluetooth_version_text).publish_state(version.valid() ? version.text() : "Unknown");
+      }
+      id(confirming_write) = false;
       id(is_polling) = false;
+      id(current_batch).clear();
 
-      id(last_ble_read) = millis() / 1000;  // seconds
-      ESP_LOGD("ble_watchdog", "Updated last BLE read: %u", id(last_ble_read));
+      id(last_ble_read) = millis();
+      ESP_LOGD("thermatik", "Updated last BLE read: %u", static_cast<unsigned>(id(last_ble_read)));
 
       return true;

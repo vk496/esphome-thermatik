@@ -4,6 +4,10 @@
 #include <map>
 #include <string>
 #include <stdint.h>
+#include <vector>
+
+#include "esphome/core/log.h"
+#include "thermatik_protocol.h"
 
 struct HexEntry
 {
@@ -525,7 +529,7 @@ static const std::map<std::string, uint16_t> HEX_TABLE = []()
     std::map<std::string, uint16_t> m;
     for (auto &e : HEX_TABLE_RAW)
     {
-        auto res = m.emplace(e.name, e.value);
+        m.emplace(e.name, e.value);
     }
     return m;
 }();
@@ -560,6 +564,17 @@ static inline std::vector<uint8_t> get_hex_bytes(const std::string &name)
         return {uint8_t(v & 0xFF), uint8_t(v >> 8)};
     }
     // You decide how to handle missing keys
-    ESP_LOGE("main", "BUG: Raw value %s doesnt exist in dictionary", name.c_str());
+    ESP_LOGE("thermatik", "Unknown register key: %s", name.c_str());
     return {0x00, 0x00};
+}
+
+// Canonical polling keys for firmware-dependent fields; keep HexEntry names intact.
+static inline std::vector<uint8_t> get_read_bytes(const std::string &name, bool modern,
+    const std::vector<uint8_t> &firing, const std::string &firing_key) {
+    if (name == firing_key) return firing;
+    if (name == "RelayFunct1" || name == "RelayFunct2" || name == "RelayFunct3") {
+        const uint16_t address = (modern ? 0x1CDA : 0x1C78) + 2 * (name.back() - '1');
+        return {uint8_t(address & 0xFF), uint8_t(address >> 8)};
+    }
+    return get_hex_bytes(name);
 }

@@ -3,3 +3,11 @@
 # You can modify this file to suit your needs.
 /.esphome/
 /secrets.yaml
+
+# Local APK extraction, decompiler tools and validation environments
+/.analysis/
+__pycache__/
+*.py[cod]
+
+# Supplied Android app bundles used for local protocol analysis
+/*.xapk
