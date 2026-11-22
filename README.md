@@ -13,7 +13,7 @@ Follow the fire, monitor temperatures and access your S-Thermatik NEO controls t
 
 **Local connection · Actual controller readback · Runtime diagnostics**
 
-[Get started](#quick-start) · [See it in action](#screenshots) · [What's new](#whats-new) · [Troubleshooting](#diagnostics)
+[Get started](#quick-start) · [See it in action](#screenshots) · [Releases](https://github.com/vk496/esphome-thermatik/releases) · [Troubleshooting](#diagnostics)
 
 </div>
 
@@ -128,28 +128,6 @@ Automatic register selection uses `1C5C` before controller firmware 1.15.0 and `
 
 Heating changes require a known operating mode and confirmed automatic slider control. TUV/Blue Angel controls are not implemented. Normal control writes require a request through an entity; the integration keeps GATT acknowledgement, serialization and fresh readback checks active.
 
-<a id="whats-new"></a>
-
-## 🆕 What's new in v1.3.1
-
-- **Air slider right after Manual mode:** a slider position requested while the Manual mode write is still being confirmed (about 6 s) used to be refused. It is now queued behind that write, shown at once, and sent as soon as manual control is on. Heating follows a pending switch back to automatic the same way. Requests are still refused when the controller is disconnected or when another slider or heating write is already waiting.
-- **Per-control write tracking:** Manual mode, Air Slider value and Heating each keep their own pending state. Quick changes to different controls no longer interfere with each other's protection against stale polls, and a failed transaction restores every control that was still waiting.
-
-## 🆕 What's new in v1.3.0
-
-- **Controls react instantly:** Heating, Air Slider Manual mode and Air Slider value show the requested value at once. A readback then confirms it, or restores the last value the controller reported if the write does not complete. Switching quickly ON then OFF no longer flickers back to the first value.
-- **Priority polling:** Exhaust and ambient temperature, controller status, air slider and door are read on every cycle; the remaining registers rotate. On a live controller, priority values refreshed every ~6 s (median) instead of ~10.5 s with the same hardware at `fetch_interval: 10s`.
-- **No more skipped cycles:** `fetch_interval` (default now `5s`) is the minimum time between cycle starts. A cycle that runs longer is followed immediately by the next one instead of freezing every value for a full extra interval.
-- **Controls interrupt a waiting poll:** A command no longer sits out the controller's two-second settle delay of a poll that has not been read yet.
-
-## 🆕 What's new in v1.2.0
-
-- **More responsive requests:** Controls enter their own transaction queue instead of waiting for the next polling tick. Writes use the official app's settling delays and a fresh readback.
-- **Better temperature handling:** Signed decoding fixes wraparound such as `65511` becoming `-25`. Missing ambient inputs, including those reported on Basic models, remain unavailable.
-- **More visibility:** Firmware diagnostics, PT inputs, individual relay monitoring, decoded errors and icons for all 39 exposed entities.
-- **Debug without another upload:** Switch between INFO, DEBUG and VERBOSE at runtime, or print a diagnostic summary on demand.
-- **Simpler package loading:** Uses ESPHome's upstream header fix. The extra Git-library workaround is gone.
-
 <details>
 <summary>⬆️ Upgrading from an older version</summary>
 
@@ -199,9 +177,7 @@ Press **Thermatik diagnostics** for current firmware, operating mode, transactio
 
 The protocol audit covers the supplied **PROD-2025.11.26** Android bundles. All **503 distinct register name/address pairs** already matched the integration; 523 property initializers include 20 aliases. The work corrected decoding and transaction behavior and added monitoring features.
 
-**v1.2.0 was fetched from its published GitHub tag, compiled and installed wirelessly through ESPHome Device Builder 2026.9.1.** Local/remote package imports and offline receiver/writer tests passed. Live monitoring was checked on controller firmware **1.20.1**, with Bluetooth firmware **1.2.0**.
-
-**v1.3.0 and v1.3.1** passed the offline polling, receiver and writer tests and were compiled with ESPHome 2026.9.1 and installed over the air on that same controller. On hardware, with the stove cold, the v1.3.0 build accepted every write and confirmed it by readback after about 6–7 s, while the interface updated within 0.3 s: Air Slider Manual mode ON and OFF (including four toggles within about two seconds, which ended OFF without flickering), Air Slider value changes, and Heating Low → Mid → Low. A build of the v1.3.1 code also queued a slider request sent one second after switching to Manual mode; the controller confirmed both writes, at 6.7 s and 14.3 s.
+Behavior is checked with offline receiver, writer and polling tests, and on a live controller running firmware **1.20.1** with Bluetooth firmware **1.2.0**.
 
 **Validation limits:** Door Remote, Save user settings and mechanical behavior remain unverified, as do failed-write recovery on the controller and hydronic monitoring on a system with connected PT probes. Advanced service parameters, relay configuration, certification controls and SUSI configuration remain outside the UI.
 
