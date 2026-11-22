@@ -6,7 +6,7 @@
 
 Follow the fire, monitor temperatures and access your S-Thermatik NEO controls through an ESP32 and a local Bluetooth connection.
 
-[![Version](https://img.shields.io/badge/version-v1.3.0-e87524)](https://github.com/vk496/esphome-thermatik/tree/v1.3.0)
+[![Version](https://img.shields.io/badge/version-v1.3.1-e87524)](https://github.com/vk496/esphome-thermatik/tree/v1.3.1)
 [![ESPHome](https://img.shields.io/badge/ESPHome-2026.9.0%2B-18bcf2)](https://esphome.io/)
 ![Hardware](https://img.shields.io/badge/hardware-ESP32%20%2B%20BLE-555555)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](LICENSE)
@@ -74,7 +74,7 @@ Open your device configuration and add:
 packages:
   thermatik:
     url: https://github.com/vk496/esphome-thermatik
-    ref: v1.3.0
+    ref: v1.3.1
     files:
       - path: package.yaml
         vars:
@@ -130,6 +130,11 @@ Heating changes require a known operating mode and confirmed automatic slider co
 
 <a id="whats-new"></a>
 
+## 🆕 What's new in v1.3.1
+
+- **Air slider right after Manual mode:** a slider position requested while the Manual mode write is still being confirmed (about 6 s) used to be refused. It is now queued behind that write, shown at once, and sent as soon as manual control is on. Heating follows a pending switch back to automatic the same way. Requests are still refused when the controller is disconnected or when another slider or heating write is already waiting.
+- **Per-control write tracking:** Manual mode, Air Slider value and Heating each keep their own pending state. Quick changes to different controls no longer interfere with each other's protection against stale polls, and a failed transaction restores every control that was still waiting.
+
 ## 🆕 What's new in v1.3.0
 
 - **Controls react instantly:** Heating, Air Slider Manual mode and Air Slider value show the requested value at once. A readback then confirms it, or restores the last value the controller reported if the write does not complete. Switching quickly ON then OFF no longer flickers back to the first value.
@@ -150,7 +155,7 @@ Heating changes require a known operating mode and confirmed automatic slider co
 
 - Update to **ESPHome 2026.9.0 or newer** before using this release.
 - Remove manually copied headers, their device-level `includes`, and the old `EsphomeThermatik` Git-library override. Old local headers can shadow the packaged versions.
-- Set the package reference to `v1.3.0`. Keep existing network, API and OTA settings.
+- Set the package reference to `v1.3.1`. Keep existing network, API and OTA settings.
 - If you set `fetch_interval` yourself (older examples used 7 s to 10 s), remove it or use `5s`: every polling cycle is now about 6 s of controller time, and a higher value only makes every refresh slower.
 - The old Sezam cover is replaced by **Door Remote**, a pulse button; separate open/close/stop operations were not established.
 - **Sensor Error Count** is now **Sensor Error Flags**. It is a bitfield; `7` alone is not a home-screen sensor fault in the official app.
@@ -196,9 +201,9 @@ The protocol audit covers the supplied **PROD-2025.11.26** Android bundles. All 
 
 **v1.2.0 was fetched from its published GitHub tag, compiled and installed wirelessly through ESPHome Device Builder 2026.9.1.** Local/remote package imports and offline receiver/writer tests passed. Live monitoring was checked on controller firmware **1.20.1**, with Bluetooth firmware **1.2.0**.
 
-**v1.3.0** was compiled with ESPHome 2026.9.1, passed the offline polling, receiver and writer tests, and was installed over the air on that same controller. On hardware, the Air Slider Manual mode switch was turned ON and OFF: both writes were accepted and confirmed by readback (about 6 s per transaction, with the interface updating immediately). The fix for quick ON/OFF toggles is covered by the offline tests; it was not re-run on the controller before this release.
+**v1.3.0 and v1.3.1** passed the offline polling, receiver and writer tests and were compiled with ESPHome 2026.9.1 and installed over the air on that same controller. On hardware, with the stove cold, the v1.3.0 build accepted every write and confirmed it by readback after about 6–7 s, while the interface updated within 0.3 s: Air Slider Manual mode ON and OFF (including four toggles within about two seconds, which ended OFF without flickering), Air Slider value changes, and Heating Low → Mid → Low. A build of the v1.3.1 code also queued a slider request sent one second after switching to Manual mode; the controller confirmed both writes, at 6.7 s and 14.3 s.
 
-**Validation limits:** Apart from the Manual mode switch, no controls were exercised on hardware. Write acceptance of Heating, Air Slider value, Door Remote and Save user settings, and mechanical behavior, remain unverified, as does hydronic monitoring on a system with connected PT probes. Advanced service parameters, relay configuration, certification controls and SUSI configuration remain outside the UI.
+**Validation limits:** Door Remote, Save user settings and mechanical behavior remain unverified, as do failed-write recovery on the controller and hydronic monitoring on a system with connected PT probes. Advanced service parameters, relay configuration, certification controls and SUSI configuration remain outside the UI.
 
 📚 [Read the protocol audit](docs/protocol-audit.md) · [Explore the register inventory](docs/app-registers.json)
 

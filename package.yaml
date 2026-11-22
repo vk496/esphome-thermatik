@@ -152,15 +152,12 @@ globals:
     type: size_t
     initial_value: "0"
 
-  # Controls publish the requested value at once. The key being written is protected from
-  # stale in-flight poll data until the readback confirms it; failures restore the last
-  # value actually read from the controller (-1 = never read).
-  - id: pending_write_key
-    type: std::string
-  # Writes to those controls that are queued or running (a confirmation is only shown once the last one is).
-  - id: pending_write_count
-    type: int
-    initial_value: "0"
+  # Controls publish the requested value at once. For each of them (manual mode, air slider, heating) the
+  # number of writes queued or running protects that value from stale in-flight polls and earlier readbacks
+  # until the last write is confirmed. A failure restores the last value actually read from the controller
+  # (-1 = never read).
+  - id: pending_writes
+    type: std::array<int, 3>
   - id: confirmed_manual
     type: int
     initial_value: "-1"
@@ -406,17 +403,17 @@ script:
   - id: revert_pending_write
     then:
       - lambda: |-
-          const std::string key = id(pending_write_key);
-          id(pending_write_key).clear();
-          id(pending_write_count) = 0;
-          if (key == "cAirSliderAutoManual" && id(confirmed_manual) >= 0) {
+          const auto pending = id(pending_writes);
+          id(pending_writes).fill(0);
+          if (pending[CONTROL_MANUAL] > 0 && id(confirmed_manual) >= 0)
             id(cAirSliderAutoManual).publish_state(id(confirmed_manual) == 1);
-          } else if (key == "cAirSlider" && id(confirmed_slider) >= 0) {
+          if (pending[CONTROL_SLIDER] > 0 && id(confirmed_slider) >= 0)
             id(cAirSliderPercentage).publish_state(id(confirmed_slider));
-          } else if (key == "${FiringModeAttr}" && id(confirmed_power) >= 0) {
+          if (pending[CONTROL_POWER] > 0 && id(confirmed_power) >= 0)
             id(cPowerIcon).publish_state(static_cast<size_t>(id(confirmed_power)));
-          }
-          if (!key.empty()) ESP_LOGW("thermatik", "Write to %s not confirmed; restored last controller value", key.c_str());
+          if (pending[CONTROL_MANUAL] + pending[CONTROL_SLIDER] + pending[CONTROL_POWER] > 0)
+            ESP_LOGW("thermatik", "Writes not confirmed (manual=%d slider=%d heating=%d); restored last controller values",
+                     pending[CONTROL_MANUAL], pending[CONTROL_SLIDER], pending[CONTROL_POWER]);
 
   # Runs for as long as the controller is connected. Cycle starts are paced by the
   # fetch_interval tick (poll_due), so the period is max(fetch_interval, cycle time)
@@ -454,10 +451,7 @@ script:
                   - script.stop: process_batches
             - lambda: |-
                 // Safety net: a pending-write marker must never outlive its transaction.
-                if (!id(user_transaction).is_running()) {
-                  id(pending_write_key).clear();
-                  id(pending_write_count) = 0;
-                }
+                if (!id(user_transaction).is_running()) id(pending_writes).fill(0);
                 id(current_index) = 0;
                 id(poll_cycle) = thermatik::build_poll_cycle(id(priority_batches), id(rotating_batches),
                                                              id(rotation_offset));
@@ -521,10 +515,8 @@ script:
             return;
           }
           // Controls that publish their requested value immediately; see revert_pending_write.
-          if (const char *control = optimistic_control(address, id(firing_mode_bytes), "${FiringModeAttr}")) {
-            id(pending_write_key) = control;
-            id(pending_write_count)++;
-          }
+          const int control = optimistic_control(address, id(firing_mode_bytes));
+          if (control >= 0) id(pending_writes)[control]++;
           id(user_transaction).execute(address, data, "");
 
   # Developer reads and controls share the same queue and address/data ownership.
@@ -639,9 +631,8 @@ script:
       - lambda: |-
           id(current_batch).clear();
           // This write is done; the control stays protected while more writes to it are queued.
-          if (!data.empty() && optimistic_control(address, id(firing_mode_bytes), "${FiringModeAttr}") != nullptr &&
-              id(pending_write_count) > 0) id(pending_write_count)--;
-          if (id(pending_write_count) == 0) id(pending_write_key).clear();
+          const int control = data.empty() ? -1 : optimistic_control(address, id(firing_mode_bytes));
+          if (control >= 0 && id(pending_writes)[control] > 0) id(pending_writes)[control]--;
           id(is_writing_user) = false;
           ESP_LOGD("thermatik", "User transaction complete");
 
@@ -833,8 +824,8 @@ select:
     set_action:
       - lambda: |-
           ESP_LOGD("thermatik", "Triggered set powerIcon action");
-          if (!id(connected) || id(firing_mode_bytes).empty() ||
-              !id(manual_mode_known) || id(user_transaction).is_running() ||
+          if (id(firing_mode_bytes).empty() ||
+              !controls_ready(id(connected), id(manual_mode_known), id(user_transaction).is_running(), id(pending_writes)) ||
               id(cAirSliderAutoManual).state || id(mode_value) != 3) {
             ESP_LOGW("thermatik", "Heating requires automatic control and normal burning mode");
             return;
@@ -907,7 +898,7 @@ number:
       then:
         - lambda: |-
             ESP_LOGD("thermatik", "Triggered airslider action");
-            if (id(connected) && id(manual_mode_known) && !id(user_transaction).is_running() &&
+            if (controls_ready(id(connected), id(manual_mode_known), id(user_transaction).is_running(), id(pending_writes)) &&
                 id(cAirSliderAutoManual).state) {
               id(write_user_input)->execute(get_hex_bytes("cAirSlider"),{(uint8_t)x, 0x00});
               id(cAirSliderPercentage).publish_state(x);  // Confirmed or reverted by the readback
@@ -1148,8 +1139,8 @@ sensor:
       // readback of an earlier write predates a later one. Such values are remembered as the last
       // controller state, but must not undo the optimistic UI.
       // A readback is current only if no later write to the same control is queued behind it.
-      const auto stale_poll = [&](const char *key) {
-        return id(pending_write_key) == key && (!is_confirmation || id(pending_write_count) > 1);
+      const auto stale_poll = [&](int control) {
+        return id(pending_writes)[control] > 0 && (!is_confirmation || id(pending_writes)[control] > 1);
       };
       // Availability can follow a temperature in the same response. Decode it first.
       for (size_t i = 0; i < batch_size; ++i) {
@@ -1201,7 +1192,7 @@ sensor:
         } else if ("${FiringModeAttr}" == target_batch) { // Usually FiringMode_0x1CBE
           if (value_le >= 1 && value_le <= 3) {
             id(confirmed_power) = value_le - 1;
-            if (!stale_poll("${FiringModeAttr}")) id(cPowerIcon).publish_state(static_cast<size_t>(value_le - 1));
+            if (!stale_poll(CONTROL_POWER)) id(cPowerIcon).publish_state(static_cast<size_t>(value_le - 1));
           } else {
             ESP_LOGW("thermatik", "Invalid firing mode: %d", value_le);
           }
@@ -1215,7 +1206,7 @@ sensor:
         } else if ("cAirSlider" == target_batch) {
           id(cAirSlider).publish_state(value_le);
           id(confirmed_slider) = value_le;
-          if (!stale_poll("cAirSlider")) id(cAirSliderPercentage).publish_state(value_le);
+          if (!stale_poll(CONTROL_SLIDER)) id(cAirSliderPercentage).publish_state(value_le);
 
         } else if ("BoardTemp" == target_batch) {
           id(BoardTemp).publish_state(thermatik::signed_word(value_le));
@@ -1234,7 +1225,7 @@ sensor:
         } else if ("cAirSliderAutoManual" == target_batch) {
           if (value_le == 0 || value_le == 1) {
             id(confirmed_manual) = value_le;
-            if (!stale_poll("cAirSliderAutoManual")) id(cAirSliderAutoManual).publish_state(value_le == 1);
+            if (!stale_poll(CONTROL_MANUAL)) id(cAirSliderAutoManual).publish_state(value_le == 1);
             id(manual_mode_known) = is_confirmation || !id(user_transaction).is_running();
           }
 

@@ -75,8 +75,7 @@ uint32_t last_ble_read=0;
 uint32_t millis() { return 12345; }
 std::vector<std::string> current_batch;
 std::vector<uint8_t> firing_mode_bytes;
-std::string pending_write_key;
-int pending_write_count=0;
+std::array<int,3> pending_writes{};
 bool is_writing_user=false;
 int confirmed_manual=-1, confirmed_power=-1, confirmed_slider=-1;
 '''
@@ -104,15 +103,14 @@ int main() {
   queue_write({}, {1,0}); queue_write({0,0}, {1,0}); queue_write({1,0}, {});
   connected=false; queue_write(get_hex_bytes("cAirSlider"), {1,0}); connected=true;
   assert(user_transaction.calls==5);
-  // The register being written is remembered; only controls that publish optimistically need it.
-  pending_write_key.clear(); pending_write_count=0;
-  queue_write(get_hex_bytes("cSezam"), {1,0}); assert(pending_write_key.empty() && pending_write_count==0);
-  queue_write(get_hex_bytes("cAirSlider"), {5,0}); assert(pending_write_key=="cAirSlider" && pending_write_count==1);
-  queue_write(get_hex_bytes("cAirSliderAutoManual"), {1,0});
-  assert(pending_write_key=="cAirSliderAutoManual" && pending_write_count==2);
+  // The control being written is counted; only controls that publish optimistically need it.
+  pending_writes.fill(0);
+  queue_write(get_hex_bytes("cSezam"), {1,0}); assert((pending_writes==std::array<int,3>{0,0,0}));
+  queue_write(get_hex_bytes("cAirSlider"), {5,0}); assert((pending_writes==std::array<int,3>{0,1,0}));
+  queue_write(get_hex_bytes("cAirSliderAutoManual"), {1,0}); assert((pending_writes==std::array<int,3>{1,1,0}));
   firing_mode_bytes=get_hex_bytes("FiringMode_0x1CBE"); queue_write(firing_mode_bytes, {2,0});
-  assert(pending_write_key=="auto" && pending_write_count==3);
-  firing_mode_bytes.clear(); pending_write_key.clear(); pending_write_count=0;
+  assert((pending_writes==std::array<int,3>{1,1,1}));
+  firing_mode_bytes.clear(); pending_writes.fill(0);
   // ESPHome discovery and late replies cannot consume a stale batch.
   current_batch={"cAmbientTemp"}; receive({24,0});
   assert(cAmbientTemp.calls==0 && last_ble_read==0);
@@ -182,7 +180,7 @@ int main() {
   user_transaction.running=false;
   manual_off(); assert(!manual_mode_known);
   // Controls publish the requested value at once, so Home Assistant does not wait for the controller.
-  pending_write_key.clear(); pending_write_count=0; user_transaction.running=false; connected=true; mode_value=3;
+  pending_writes.fill(0); user_transaction.running=false; connected=true; mode_value=3;
   firing_mode_bytes=get_hex_bytes("FiringMode_0x1CBE"); manual_mode_known=true;
   manual_on(); assert(cAirSliderAutoManual.state==1);
   manual_off(); assert(cAirSliderAutoManual.state==0 && !manual_mode_known);
@@ -193,44 +191,61 @@ int main() {
   cAirSliderAutoManual.state=0; cAirSlider.state=44; slider(80);
   assert(write_user_input.calls==writes+1 && cAirSliderPercentage.state==44); // rejected: restored
   // A poll that was already in flight cannot undo the pending value, but is remembered.
-  pending_write_key="cAirSliderAutoManual"; pending_write_count=1; cAirSliderAutoManual.state=1; confirmed_manual=-1;
+  pending_writes={1,0,0}; cAirSliderAutoManual.state=1; confirmed_manual=-1;
   reply({"cAirSliderAutoManual"},{0,0}); assert(cAirSliderAutoManual.state==1 && confirmed_manual==0);
-  pending_write_key="cAirSlider"; pending_write_count=1; cAirSliderPercentage.state=70;
+  pending_writes={0,1,0}; cAirSliderPercentage.state=70;
   reply({"cAirSlider"},{30,0});
   assert(cAirSliderPercentage.state==70 && cAirSlider.state==30 && confirmed_slider==30);
-  pending_write_key="auto"; pending_write_count=1; cPowerIcon.state=2;
+  pending_writes={0,0,1}; cPowerIcon.state=2;
   reply({"auto"},{1,0}); assert(cPowerIcon.state==2 && confirmed_power==0);
-  // Other keys, and polls after the transaction, publish normally; the readback always does.
-  pending_write_key="cAirSlider"; reply({"cAirSliderAutoManual"},{0,0}); assert(cAirSliderAutoManual.state==0);
+  // Other controls, and polls after the transaction, publish normally; the readback always does.
+  pending_writes={0,1,0}; reply({"cAirSliderAutoManual"},{0,0}); assert(cAirSliderAutoManual.state==0);
   confirming_write=true; expected_write_value=30; reply({"cAirSlider"},{30,0});
   assert(cAirSliderPercentage.state==30 && write_readback_matches);
-  pending_write_key.clear(); reply({"cAirSlider"},{35,0}); assert(cAirSliderPercentage.state==35);
+  pending_writes.fill(0); reply({"cAirSlider"},{35,0}); assert(cAirSliderPercentage.state==35);
   // Overlapping writes to one control (ON then OFF): the first readback must not undo the queued OFF.
-  pending_write_key="cAirSliderAutoManual"; pending_write_count=2; cAirSliderAutoManual.state=0;
+  pending_writes={2,0,0}; cAirSliderAutoManual.state=0;
   confirming_write=true; expected_write_value=1; reply({"cAirSliderAutoManual"},{1,0});
   assert(cAirSliderAutoManual.state==0 && confirmed_manual==1); // remembered, not shown
   finish_tx(get_hex_bytes("cAirSliderAutoManual"),{1,0},"");
-  assert(pending_write_count==1 && pending_write_key=="cAirSliderAutoManual" && is_writing_user==false);
+  assert(pending_writes[CONTROL_MANUAL]==1 && is_writing_user==false);
   cAirSliderAutoManual.state=1; confirming_write=true; expected_write_value=0;
   reply({"cAirSliderAutoManual"},{0,0});
   assert(cAirSliderAutoManual.state==0 && confirmed_manual==0 && write_readback_matches); // last one is shown
   finish_tx(get_hex_bytes("cAirSliderAutoManual"),{0,0},"");
-  assert(pending_write_count==0 && pending_write_key.empty());
+  assert((pending_writes==std::array<int,3>{0,0,0}));
   // Writes that are not optimistic controls, and developer reads, never touch the bookkeeping.
-  pending_write_key="cAirSlider"; pending_write_count=1;
+  pending_writes={0,1,0};
   finish_tx(get_hex_bytes("cSezam"),{1,0},""); finish_tx(get_hex_bytes("cAirSlider"),{},"cAirSlider");
-  assert(pending_write_count==1 && pending_write_key=="cAirSlider");
-  finish_tx(get_hex_bytes("cAirSlider"),{9,0},""); assert(pending_write_count==0 && pending_write_key.empty());
-  finish_tx(get_hex_bytes("cAirSlider"),{9,0},""); assert(pending_write_count==0); // never negative
-  // A write that never reached the controller restores the last value it reported.
+  assert((pending_writes==std::array<int,3>{0,1,0}));
+  finish_tx(get_hex_bytes("cAirSlider"),{9,0},""); assert((pending_writes==std::array<int,3>{0,0,0}));
+  finish_tx(get_hex_bytes("cAirSlider"),{9,0},""); assert((pending_writes==std::array<int,3>{0,0,0})); // never negative
+  // The slider waits in the queue behind a pending manual-mode write instead of being refused...
+  manual_mode_known=false; user_transaction.running=true; pending_writes={1,0,0};
+  cAirSliderAutoManual.state=1; writes=write_user_input.calls;
+  slider(55); assert(write_user_input.calls==writes+1 && cAirSliderPercentage.state==55);
+  // ...but is never stacked on another pending control, or on anything but a manual-mode write.
+  pending_writes={1,1,0}; slider(65); assert(write_user_input.calls==writes+1);
+  pending_writes={0,0,0}; cAirSliderPercentage.state=40; cAirSlider.state=40; slider(65);
+  assert(write_user_input.calls==writes+1 && cAirSliderPercentage.state==40); // refused, restored
+  // Heating likewise follows a pending manual-OFF write, but never a pending slider write.
+  pending_writes={1,0,0}; cAirSliderAutoManual.state=0; mode_value=3; writes=write_user_input.calls;
+  heat("Mid"); assert(write_user_input.calls==writes+1 && cPowerIcon.state==1);
+  pending_writes={1,1,0}; heat("High"); assert(write_user_input.calls==writes+1);
+  assert(!controls_ready(false,true,false,std::array<int,3>{0,0,0}));
+  assert(controls_ready(true,true,false,std::array<int,3>{0,0,0}));
+  assert(!controls_ready(true,false,true,std::array<int,3>{0,0,0}));
+  assert(!controls_ready(true,false,false,std::array<int,3>{1,0,0}));
+  user_transaction.running=false; manual_mode_known=true;
+  // A write that never reached the controller restores the last value it reported, for each pending control.
   confirmed_manual=1; confirmed_slider=35; confirmed_power=1;
-  pending_write_key="cAirSliderAutoManual"; cAirSliderAutoManual.state=0; revert();
-  assert(cAirSliderAutoManual.state==1 && pending_write_key.empty());
-  pending_write_count=3; pending_write_key="cAirSlider"; revert(); assert(pending_write_count==0);
-  pending_write_key="cAirSlider"; cAirSliderPercentage.state=90; revert(); assert(cAirSliderPercentage.state==35);
-  pending_write_key="auto"; cPowerIcon.state=0; revert(); assert(cPowerIcon.state==1);
-  confirmed_power=-1; pending_write_key="auto"; cPowerIcon.state=0; revert();
-  assert(cPowerIcon.state==0 && pending_write_key.empty()); // nothing known to restore
+  pending_writes={1,0,0}; cAirSliderAutoManual.state=0; revert();
+  assert(cAirSliderAutoManual.state==1 && (pending_writes==std::array<int,3>{0,0,0}));
+  pending_writes={1,1,1}; cAirSliderAutoManual.state=0; cAirSliderPercentage.state=90; cPowerIcon.state=0; revert();
+  assert(cAirSliderAutoManual.state==1 && cAirSliderPercentage.state==35 && cPowerIcon.state==1);
+  pending_writes={0,1,0}; cAirSliderAutoManual.state=0; cAirSliderPercentage.state=90; revert();
+  assert(cAirSliderAutoManual.state==0 && cAirSliderPercentage.state==35); // only what was pending
+  confirmed_power=-1; pending_writes={0,0,1}; cPowerIcon.state=0; revert(); assert(cPowerIcon.state==0); // nothing known
   cAirSliderAutoManual.state=0; revert(); assert(cAirSliderAutoManual.state==0); // nothing pending
   // Relay status is a bitfield, while the three function registers depend on firmware.
   reply({"_RelayStatus"},{5,0}); assert(relay_1_active.state==1 && relay_2_active.state==0 && relay_3_active.state==1);

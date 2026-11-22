@@ -579,12 +579,24 @@ static inline std::vector<uint8_t> get_read_bytes(const std::string &name, bool 
     return get_hex_bytes(name);
 }
 
-// Controls that publish the requested value before the controller confirms it. Returns the
-// polling key of the register being written, or nullptr for any other write (door, save...).
-static inline const char *optimistic_control(const std::vector<uint8_t> &address,
-    const std::vector<uint8_t> &heating, const char *heating_key) {
-    if (address == get_hex_bytes("cAirSliderAutoManual")) return "cAirSliderAutoManual";
-    if (address == get_hex_bytes("cAirSlider")) return "cAirSlider";
-    if (!heating.empty() && address == heating) return heating_key;
-    return nullptr;
+// Controls that publish the requested value before the controller confirms it.
+enum OptimisticControl : int { CONTROL_MANUAL = 0, CONTROL_SLIDER = 1, CONTROL_POWER = 2 };
+
+// Which optimistic control a register write targets, or -1 for any other write (door, save...).
+static inline int optimistic_control(const std::vector<uint8_t> &address, const std::vector<uint8_t> &heating) {
+    if (address == get_hex_bytes("cAirSliderAutoManual")) return CONTROL_MANUAL;
+    if (address == get_hex_bytes("cAirSlider")) return CONTROL_SLIDER;
+    if (!heating.empty() && address == heating) return CONTROL_POWER;
+    return -1;
+}
+
+// Air slider and heating depend on the manual-mode state. They are accepted once it is confirmed, and also
+// while only a manual-mode write is pending: the transaction queue is first-in first-out, so they run after
+// it, and if that write fails the whole queue is discarded. Never stack them on each other or on other writes.
+static inline bool controls_ready(bool connected, bool manual_known, bool transaction_running,
+                                  const std::array<int, 3> &pending) {
+    if (!connected) return false;
+    if (manual_known && !transaction_running) return true;
+    return transaction_running && pending[CONTROL_MANUAL] > 0 && pending[CONTROL_SLIDER] == 0 &&
+           pending[CONTROL_POWER] == 0;
 }
