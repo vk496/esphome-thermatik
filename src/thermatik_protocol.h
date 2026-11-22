@@ -5,10 +5,35 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 // Protocol behavior recovered from S-Thermatik NEO PROD-2025.11.26.
 // See docs/protocol-audit.md for native function addresses and limitations.
 namespace thermatik {
+
+constexpr size_t REGISTERS_PER_READ = 5;  // ADDRESS buffer holds five 16-bit registers
+
+// One polling cycle: a slice of the rotating registers first (so availability
+// flags are known before the temperatures that depend on them), then the
+// priority registers, which are therefore read on every cycle. `offset` advances
+// so the whole rotating list is covered over successive cycles.
+//
+// Keep priority + slice a multiple of REGISTERS_PER_READ. A short final read is
+// padded with unrelated registers, which wastes a ~2 s controller round trip.
+inline std::vector<std::string> build_poll_cycle(const std::vector<std::string> &priority,
+                                                 const std::vector<std::string> &rotating,
+                                                 size_t &offset,
+                                                 size_t slice = REGISTERS_PER_READ) {
+  std::vector<std::string> cycle;
+  if (!rotating.empty()) {
+    offset %= rotating.size();
+    const size_t count = slice < rotating.size() ? slice : rotating.size();
+    for (size_t i = 0; i < count; ++i) cycle.push_back(rotating[(offset + i) % rotating.size()]);
+    offset = (offset + count) % rotating.size();
+  }
+  cycle.insert(cycle.end(), priority.begin(), priority.end());
+  return cycle;
+}
 
 enum DiagnosticIndex : size_t {
   DIAG_SEQUENCE,

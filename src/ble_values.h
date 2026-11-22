@@ -578,3 +578,13 @@ static inline std::vector<uint8_t> get_read_bytes(const std::string &name, bool 
     }
     return get_hex_bytes(name);
 }
+
+// Controls that publish the requested value before the controller confirms it. Returns the
+// polling key of the register being written, or nullptr for any other write (door, save...).
+static inline const char *optimistic_control(const std::vector<uint8_t> &address,
+    const std::vector<uint8_t> &heating, const char *heating_key) {
+    if (address == get_hex_bytes("cAirSliderAutoManual")) return "cAirSliderAutoManual";
+    if (address == get_hex_bytes("cAirSlider")) return "cAirSlider";
+    if (!heating.empty() && address == heating) return heating_key;
+    return nullptr;
+}

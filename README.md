@@ -6,7 +6,7 @@
 
 Follow the fire, monitor temperatures and access your S-Thermatik NEO controls through an ESP32 and a local Bluetooth connection.
 
-[![Version](https://img.shields.io/badge/version-v1.2.0-e87524)](https://github.com/vk496/esphome-thermatik/tree/v1.2.0)
+[![Version](https://img.shields.io/badge/version-v1.3.0-e87524)](https://github.com/vk496/esphome-thermatik/tree/v1.3.0)
 [![ESPHome](https://img.shields.io/badge/ESPHome-2026.9.0%2B-18bcf2)](https://esphome.io/)
 ![Hardware](https://img.shields.io/badge/hardware-ESP32%20%2B%20BLE-555555)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](LICENSE)
@@ -74,13 +74,13 @@ Open your device configuration and add:
 packages:
   thermatik:
     url: https://github.com/vk496/esphome-thermatik
-    ref: v1.2.0
+    ref: v1.3.0
     files:
       - path: package.yaml
         vars:
           mac_address: "3C:E0:64:XX:XX:XX"
           # pincode: "000000"   # Set this if you changed the default PIN.
-          # fetch_interval: 7s
+          # fetch_interval: 5s   # Minimum time between polling cycles
           # FiringModeAttr: "auto"
 ```
 
@@ -130,6 +130,13 @@ Heating changes require a known operating mode and confirmed automatic slider co
 
 <a id="whats-new"></a>
 
+## 🆕 What's new in v1.3.0
+
+- **Controls react instantly:** Heating, Air Slider Manual mode and Air Slider value show the requested value at once. A readback then confirms it, or restores the last value the controller reported if the write does not complete. Switching quickly ON then OFF no longer flickers back to the first value.
+- **Priority polling:** Exhaust and ambient temperature, controller status, air slider and door are read on every cycle; the remaining registers rotate. On a live controller, priority values refreshed every ~6 s (median) instead of ~10.5 s with the same hardware at `fetch_interval: 10s`.
+- **No more skipped cycles:** `fetch_interval` (default now `5s`) is the minimum time between cycle starts. A cycle that runs longer is followed immediately by the next one instead of freezing every value for a full extra interval.
+- **Controls interrupt a waiting poll:** A command no longer sits out the controller's two-second settle delay of a poll that has not been read yet.
+
 ## 🆕 What's new in v1.2.0
 
 - **More responsive requests:** Controls enter their own transaction queue instead of waiting for the next polling tick. Writes use the official app's settling delays and a fresh readback.
@@ -143,7 +150,8 @@ Heating changes require a known operating mode and confirmed automatic slider co
 
 - Update to **ESPHome 2026.9.0 or newer** before using this release.
 - Remove manually copied headers, their device-level `includes`, and the old `EsphomeThermatik` Git-library override. Old local headers can shadow the packaged versions.
-- Set the package reference to `v1.2.0`. Keep existing network, API and OTA settings.
+- Set the package reference to `v1.3.0`. Keep existing network, API and OTA settings.
+- If you set `fetch_interval` yourself (older examples used 7 s to 10 s), remove it or use `5s`: every polling cycle is now about 6 s of controller time, and a higher value only makes every refresh slower.
 - The old Sezam cover is replaced by **Door Remote**, a pulse button; separate open/close/stop operations were not established.
 - **Sensor Error Count** is now **Sensor Error Flags**. It is a bitfield; `7` alone is not a home-screen sensor fault in the official app.
 - Controller states 4 and 5 now display **Glowing** and **Chamber flush**.
@@ -170,12 +178,14 @@ Press **Thermatik diagnostics** for current firmware, operating mode, transactio
 <details>
 <summary>⏱️ Polling, timing and reconnects</summary>
 
-- `fetch_interval` triggers complete polling cycles. A trigger is skipped quietly while a cycle is still running.
-- Relay states refresh with normal polling. Extended diagnostics refresh about once per minute.
+- Each polling cycle is two controller reads: the **priority registers** (exhaust and ambient temperature, controller status, air slider, door) every cycle, plus five of the remaining registers in rotation. Priority values therefore refresh every cycle, everything else every other cycle.
+- `fetch_interval` (default `5s`) is the minimum time between cycle starts. A cycle that takes longer is followed immediately by the next one, so a slow cycle never leaves the controller idle. Lowering it below the cycle time (about 5 s) has no further effect; raising it slows every refresh, since a cycle is only about 5 s of controller time.
+- Relay states refresh with normal polling. Extended diagnostics are added to one cycle about once a minute.
+- Controls update in Home Assistant immediately. The value is then confirmed by a readback, or restored to the last value the controller reported if the write does not complete.
 - `ble_write_settle: 1200ms` matches the app's delay after ADDRESS and DATA writes.
 - `ble_read_settle: 2s` retains the observed delay for polling and developer reads.
 - `ble_response_timeout: 3s` bounds GATT acknowledgements and reads. Failed transactions disconnect; control commands are not automatically retried.
-- A control may wait for an in-flight BLE operation, but does not wait for the next polling tick.
+- A control interrupts a poll that is only waiting for the controller to respond; it waits only for a read that is already in flight.
 - **Reboot BLE** disconnects for ten seconds before restarting, leaving a connection window for the official app.
 
 </details>
@@ -186,7 +196,9 @@ The protocol audit covers the supplied **PROD-2025.11.26** Android bundles. All 
 
 **v1.2.0 was fetched from its published GitHub tag, compiled and installed wirelessly through ESPHome Device Builder 2026.9.1.** Local/remote package imports and offline receiver/writer tests passed. Live monitoring was checked on controller firmware **1.20.1**, with Bluetooth firmware **1.2.0**.
 
-**Validation limits:** No actuator commands were sent during live checks. Write acceptance and mechanical behavior remain unverified on hardware, as does hydronic monitoring on a system with connected PT probes. Advanced service parameters, relay configuration, certification controls and SUSI configuration remain outside the UI.
+**v1.3.0** was compiled with ESPHome 2026.9.1, passed the offline polling, receiver and writer tests, and was installed over the air on that same controller. On hardware, the Air Slider Manual mode switch was turned ON and OFF: both writes were accepted and confirmed by readback (about 6 s per transaction, with the interface updating immediately). The fix for quick ON/OFF toggles is covered by the offline tests; it was not re-run on the controller before this release.
+
+**Validation limits:** Apart from the Manual mode switch, no controls were exercised on hardware. Write acceptance of Heating, Air Slider value, Door Remote and Save user settings, and mechanical behavior, remain unverified, as does hydronic monitoring on a system with connected PT probes. Advanced service parameters, relay configuration, certification controls and SUSI configuration remain outside the UI.
 
 📚 [Read the protocol audit](docs/protocol-audit.md) · [Explore the register inventory](docs/app-registers.json)
 
